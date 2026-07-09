@@ -9,6 +9,11 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ## [Unreleased]
 
+### Added
+
+- `build-windows.bat`: builds `squish.dll` + `squish.exe` with MSVC from a
+  plain command prompt (locates Visual Studio via vswhere; no make needed)
+
 ## [1.0.0]
 
 ### Added

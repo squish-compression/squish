@@ -4,6 +4,13 @@
 *.so
 *.so.*
 /squish
+
+# Windows build artifacts (mingw 'make dll' / MSVC 'make windows-dll')
+*.obj
+*.dll
+*.exe
+*.lib
+*.exp
 tests/test_squish
 tools/squish-ref
 

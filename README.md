@@ -38,6 +38,9 @@ make dll        # squish.dll + squish.exe via mingw-w64 cross compiler, if insta
 make windows-dll   # squish.dll + squish.exe via MSVC (cl.exe on PATH), native Windows build
 ```
 
+On Windows without make, run `build-windows.bat` — it locates Visual
+Studio automatically and builds `squish.dll` + `squish.exe`.
+
 No dependencies beyond libc/libm.
 
 ## CLI
