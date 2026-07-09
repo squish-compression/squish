@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an improvement to libsquish, the CLI, or the docs.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that SQUISH doesn't support today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        What would you like to see? If this affects the compressed format
+        (see "Format stability" in CONTRIBUTING.md), note that here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

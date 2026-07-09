@@ -1,0 +1,48 @@
+name: Bug report
+description: Something in libsquish or the CLI doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Minimal repro steps. If the bug is data-dependent, attach the
+        smallest input file that triggers it (or a way to generate one).
+      placeholder: |
+        ./squish c input.bin input.sq
+        ./squish d input.sq restored.bin
+        diff input.bin restored.bin
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      description: Output of `git rev-parse HEAD`, or the release tag.
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, compiler, and version (e.g. `gcc --version`).
+      placeholder: "Ubuntu 22.04, gcc 12.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Stack trace, ASan/valgrind output, etc.
