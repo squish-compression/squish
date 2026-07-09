@@ -34,7 +34,7 @@ zip/bzip2/rar don't and buys ratio with it.
 make            # libsquish.so + squish CLI
 make test       # build and run the test suite
 make install    # headers, libs, CLI, pkg-config file to /usr/local
-make dll        # squish.dll via mingw-w64 cross compiler, if installed
+make dll        # squish.dll + squish.exe via mingw-w64 cross compiler, if installed
 ```
 
 No dependencies beyond libc/libm. For a Windows DLL without mingw, compile

@@ -3,7 +3,7 @@
 # Targets:
 #   make            build libsquish.so, libsquish.a, and the squish CLI
 #   make test       build + run the test suite
-#   make dll        cross-compile squish.dll (needs x86_64-w64-mingw32-gcc)
+#   make dll        cross-compile squish.dll + squish.exe (needs mingw-w64)
 #   make install    install to $(PREFIX) (default /usr/local)
 #   make clean
 
@@ -19,6 +19,7 @@ SOMAJOR   = 1
 SONAME    = libsquish.so.$(SOMAJOR)
 
 MINGW    ?= x86_64-w64-mingw32-gcc
+MINGW_AR ?= x86_64-w64-mingw32-ar
 
 all: libsquish.so squish
 
@@ -42,11 +43,21 @@ libsquish.a: squish.o
 squish: squish_cli.c libsquish.a
 	$(CC) $(CFLAGS) $(WARN) -o $@ squish_cli.c libsquish.a -lm
 
-# ---- Windows DLL (cross-compile; or use cl.exe /DSQUISH_BUILD_DLL) ------------
-dll: squish.dll
+# ---- Windows DLL + CLI (cross-compile; or use cl.exe /DSQUISH_BUILD_DLL) ------
+dll: squish.dll squish.exe
+
 squish.dll: squish.c squish.h
 	$(MINGW) $(CFLAGS) $(WARN) -DSQUISH_BUILD_DLL -shared \
 	    -o $@ squish.c -Wl,--out-implib,libsquish.dll.a
+
+squish-win.o: squish.c squish.h
+	$(MINGW) $(CFLAGS) $(WARN) -c -o $@ squish.c
+
+libsquish-win.a: squish-win.o
+	$(MINGW_AR) rcs $@ $^
+
+squish.exe: squish_cli.c libsquish-win.a
+	$(MINGW) $(CFLAGS) $(WARN) -o $@ squish_cli.c libsquish-win.a -lm
 
 # ---- tests / examples ---------------------------------------------------------
 test: tests/test_squish
@@ -75,6 +86,7 @@ install: libsquish.so libsquish.a squish
 
 clean:
 	rm -f libsquish.so libsquish.so.* libsquish.a squish.o squish \
-	      squish.dll libsquish.dll.a tests/test_squish examples/example
+	      squish.dll libsquish.dll.a squish-win.o libsquish-win.a squish.exe \
+	      tests/test_squish examples/example
 
 .PHONY: all dll test example install clean
