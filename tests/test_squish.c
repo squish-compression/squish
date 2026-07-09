@@ -166,6 +166,69 @@ int main(void) {
               == SQUISH_E_IO, "missing input file");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
     }
+    {   /* multi-threaded round-trip: chunked SQ01 stream, all readers */
+        static uint8_t t[500000];
+        const char *w[] = {"alpha ","beta ","gamma ","delta ","omega "};
+        size_t p = 0;
+        while (p < sizeof t) {
+            const char *s = w[rnd() % 5];
+            for (const char *q = s; *q && p < sizeof t; q++) t[p++] = (uint8_t)*q;
+        }
+        void *c = NULL; size_t cn = 0;
+        int rc = squish_compress_alloc_mt(t, sizeof t, &c, &cn,
+                                          4, SQUISH_MIN_CHUNK, NULL, NULL);
+        CHECK(rc == SQUISH_OK, "compress_mt text 500k");
+        CHECK(cn <= squish_compress_bound(sizeof t), "  within bound");
+        CHECK(cn >= 4 && memcmp(c, "SQ01", 4) == 0, "  multi-block magic");
+        uint64_t hdr_n = 0;
+        CHECK(squish_decompressed_size(c, cn, &hdr_n) == SQUISH_OK &&
+              hdr_n == sizeof t, "  header size");
+        void *d = NULL; size_t dn = 0;
+        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 4, NULL, NULL);
+        CHECK(rc == SQUISH_OK && dn == sizeof t && memcmp(t, d, dn) == 0,
+              "  mt decompress identical");
+        squish_free(d); d = NULL; dn = 0;
+        rc = squish_decompress_alloc(c, cn, &d, &dn);    /* plain API reads SQ01 */
+        CHECK(rc == SQUISH_OK && dn == sizeof t && memcmp(t, d, dn) == 0,
+              "  plain decompress reads SQ01");
+        squish_free(d);
+        /* stream must not depend on thread count */
+        void *c1 = NULL; size_t c1n = 0;
+        rc = squish_compress_alloc_mt(t, sizeof t, &c1, &c1n,
+                                      1, SQUISH_MIN_CHUNK, NULL, NULL);
+        CHECK(rc == SQUISH_OK && c1n == cn && memcmp(c, c1, cn) == 0,
+              "  output independent of thread count");
+        squish_free(c1);
+        /* corrupting any chunk must fail the (per-chunk) checksum */
+        ((uint8_t*)c)[cn - 3] ^= 0x40;
+        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 4, NULL, NULL);
+        CHECK(rc == SQUISH_E_CHECKSUM && d == NULL,
+              "  chunk corruption detected");
+        squish_free(c);
+    }
+    {   /* mt on random data: outer stored-mode fallback keeps the bound */
+        static uint8_t r[300000];
+        for (size_t i = 0; i < sizeof r; i++) r[i] = rnd();
+        void *c = NULL; size_t cn = 0;
+        int rc = squish_compress_alloc_mt(r, sizeof r, &c, &cn,
+                                          0, SQUISH_MIN_CHUNK, NULL, NULL);
+        CHECK(rc == SQUISH_OK && cn <= squish_compress_bound(sizeof r),
+              "compress_mt random within bound");
+        void *d = NULL; size_t dn = 0;
+        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 0, NULL, NULL);
+        CHECK(rc == SQUISH_OK && dn == sizeof r && memcmp(r, d, dn) == 0,
+              "  round-trip identical");
+        squish_free(c); squish_free(d);
+    }
+    {   /* small input through the mt API stays a plain SQ02 stream */
+        const char *msg = "tiny input, one chunk";
+        uint8_t buf[128]; size_t bn = sizeof buf;
+        int rc = squish_compress_mt(msg, strlen(msg), buf, &bn,
+                                    8, 0, NULL, NULL);
+        CHECK(rc == SQUISH_OK && memcmp(buf, "SQ02", 4) == 0,
+              "compress_mt small input emits SQ02");
+        CHECK(squish_threads() >= 1, "squish_threads");
+    }
     {   /* progress-reporting file helpers */
         const char *tmp_in  = "tests/.t_in";
         const char *tmp_sq  = "tests/.t_sq";
@@ -189,6 +252,39 @@ int main(void) {
               progress_state.done == progress_state.total &&
               progress_state.total == 200000,
               "  decompress progress reported");
+        remove(tmp_in); remove(tmp_sq); remove(tmp_out);
+    }
+    {   /* mt file helpers with aggregated progress */
+        const char *tmp_in  = "tests/.t_in";
+        const char *tmp_sq  = "tests/.t_sq";
+        const char *tmp_out = "tests/.t_out";
+        FILE *f = fopen(tmp_in, "wb");
+        for (int i = 0; i < 300000; i++) fputc((i * 31) & 255, f);
+        fclose(f);
+        memset(&progress_state, 0, sizeof progress_state);
+        progress_state.monotonic = 1;
+        CHECK(squish_compress_file_mt(tmp_in, tmp_sq, 3, SQUISH_MIN_CHUNK,
+                                      progress_probe, &progress_state)
+              == SQUISH_OK, "compress_file_mt");
+        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
+              progress_state.done == progress_state.total &&
+              progress_state.total == 300000,
+              "  mt compress progress monotonic");
+        memset(&progress_state, 0, sizeof progress_state);
+        progress_state.monotonic = 1;
+        CHECK(squish_decompress_file_mt(tmp_sq, tmp_out, 3,
+                                        progress_probe, &progress_state)
+              == SQUISH_OK, "decompress_file_mt");
+        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
+              progress_state.done == progress_state.total &&
+              progress_state.total == 300000,
+              "  mt decompress progress monotonic");
+        FILE *a = fopen(tmp_in, "rb"), *b = fopen(tmp_out, "rb");
+        int same = 1, ca, cb2;
+        do { ca = fgetc(a); cb2 = fgetc(b); if (ca != cb2) same = 0; }
+        while (ca != EOF && cb2 != EOF);
+        fclose(a); fclose(b);
+        CHECK(same, "  mt file round-trip identical");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
     }
 

@@ -46,9 +46,21 @@ No dependencies beyond libc/libm.
 ## CLI
 
 ```sh
-./squish c bigfile bigfile.sq     # compress
-./squish d bigfile.sq restored    # decompress (checksum-verified)
+./squish c bigfile bigfile.sq          # compress
+./squish d bigfile.sq restored         # decompress (checksum-verified)
+./squish -t 0 c bigfile bigfile.sq     # compress on all cores (multi-block)
+./squish -t 0 -b 4 c big big.sq        # ... with 4 MiB blocks (more parallel,
+                                       #     slightly worse ratio)
 ```
+
+`-t N` compresses with N threads (`0` = all cores) by splitting the input
+into independently modeled blocks — near-linear speedup, at a small ratio
+cost because each block's model starts cold (about 1–2% at the default
+16 MiB blocks, more at smaller `-b` sizes). The default `-t 1` keeps the
+ratio-optimal single-block format used for the results table above.
+Decompression always uses all cores when the stream allows it (`-t` caps
+it) and reads both formats transparently. Budget ~150 MB of model memory
+per thread.
 
 When stderr is a terminal, a live status line (percent, bytes, throughput)
 is shown while working, followed by a one-line summary. Pass `-q` /
@@ -68,8 +80,16 @@ squish_decompress_alloc(c, cn, &d, &dn);   /* integrity-checked */
 squish_free(c);  squish_free(d);
 ```
 
-Link with `-lsquish -lm` (or `pkg-config --cflags --libs squish` after
-`make install`).
+Multi-threaded variants take a thread count (0 = all cores) and, for
+compression, a chunk size (0 = 16 MiB default):
+
+```c
+squish_compress_alloc_mt(data, n, &c, &cn, 0, 0, NULL, NULL);
+squish_decompress_alloc_mt(c, cn, &d, &dn, 0, NULL, NULL);
+```
+
+Link with `-lsquish -lm -pthread` (or `pkg-config --cflags --libs squish`
+after `make install`).
 
 Python needs no wrapper — `libsquish.so` loads directly with ctypes; see
 [examples/example.py](examples/example.py).

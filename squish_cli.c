@@ -23,12 +23,25 @@
 #include <time.h>
 
 #if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
 #  include <io.h>
 #  define SQ_ISATTY(f) _isatty(_fileno(f))
 #else
 #  include <unistd.h>
 #  define SQ_ISATTY(f) isatty(fileno(f))
 #endif
+
+/* wall clock: clock() sums CPU time across threads, useless with -t */
+static double now_sec(void) {
+#if defined(_WIN32)
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
 
 static long long file_size(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -42,9 +55,14 @@ static long long file_size(const char *path) {
 static int usage(void) {
     fprintf(stderr,
         "SQUISH %s — context-mixing compressor\n"
-        "usage: squish [-q] c input output   (compress)\n"
-        "       squish [-q] d input output   (decompress)\n"
-        "  -q, --quiet   no progress or summary; errors only\n",
+        "usage: squish [-q] [-t N] c input output   (compress)\n"
+        "       squish [-q] [-t N] d input output   (decompress)\n"
+        "  -q, --quiet     no progress or summary; errors only\n"
+        "  -t, --threads N use N threads, 0 = all cores (compress default: 1,\n"
+        "                  which keeps the ratio-optimal single-block format;\n"
+        "                  decompress default: all cores)\n"
+        "  -b, --block N   with -t: split input into N MiB blocks (default 16;\n"
+        "                  smaller = more parallelism, slightly worse ratio)\n",
         squish_version());
     return 2;
 }
@@ -53,7 +71,7 @@ static int usage(void) {
  * so redirected output doesn't fill with carriage returns. */
 typedef struct {
     const char *verb;
-    clock_t     t0;
+    double      t0;
     int         last_pct;   /* last percent drawn; -1 = nothing drawn yet */
 } status;
 
@@ -62,7 +80,7 @@ static void draw_status(uint64_t done, uint64_t total, void *user) {
     int pct = total ? (int)(100.0 * (double)done / (double)total) : 100;
     if (pct == st->last_pct) return;
     st->last_pct = pct;
-    double dt = (double)(clock() - st->t0) / CLOCKS_PER_SEC;
+    double dt = now_sec() - st->t0;
     fprintf(stderr, "\r%s: %3d%%  %.1f / %.1f MB  %.2f MB/s ",
         st->verb, pct, (double)done / 1e6, (double)total / 1e6,
         dt > 0 ? (double)done / 1e6 / dt : 0.0);
@@ -74,11 +92,26 @@ static void clear_status(const status *st) {
 }
 
 int main(int argc, char **argv) {
-    int quiet = 0;
+    int quiet = 0, threads = -1;    /* -1 = unset: per-direction default */
+    size_t block = 0;               /* 0 = library default */
     const char *pos[3] = {0};
     int npos = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--threads")) {
+            char *end;
+            if (++i >= argc) return usage();
+            long v = strtol(argv[i], &end, 10);
+            if (*end || v < 0 || v > 4096) return usage();
+            threads = (int)v;
+        }
+        else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--block")) {
+            char *end;
+            if (++i >= argc) return usage();
+            long v = strtol(argv[i], &end, 10);
+            if (*end || v < 1 || v > 4096) return usage();
+            block = (size_t)v << 20;
+        }
         else if (argv[i][0] == '-' && argv[i][1]) return usage();
         else if (npos < 3) pos[npos++] = argv[i];
         else return usage();
@@ -86,16 +119,19 @@ int main(int argc, char **argv) {
     if (npos != 3 || (pos[0][0] != 'c' && pos[0][0] != 'd') || pos[0][1])
         return usage();
     int compress = (pos[0][0] == 'c');
+    if (threads < 0) threads = compress ? 1 : 0;    /* 0 = all cores */
 
-    status st = { compress ? "compressing" : "decompressing", clock(), -1 };
+    status st = { compress ? "compressing" : "decompressing", now_sec(), -1 };
     squish_progress_fn cb =
         (!quiet && SQ_ISATTY(stderr)) ? draw_status : NULL;
 
-    clock_t t0 = clock();
+    double t0 = now_sec();
     int rc = compress
-        ? squish_compress_file2(pos[1], pos[2], cb, &st)
-        : squish_decompress_file2(pos[1], pos[2], cb, &st);
-    double dt = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        ? (threads == 1 && !block
+            ? squish_compress_file2(pos[1], pos[2], cb, &st)
+            : squish_compress_file_mt(pos[1], pos[2], threads, block, cb, &st))
+        : squish_decompress_file_mt(pos[1], pos[2], threads, cb, &st);
+    double dt = now_sec() - t0;
     clear_status(&st);
     if (rc != SQUISH_OK) {
         fprintf(stderr, "squish: %s: %s\n", pos[1], squish_strerror(rc));

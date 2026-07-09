@@ -77,6 +77,19 @@ typedef int64_t  i64;
 static const u8 MAGIC[4] = { 'S', 'Q', '0', '2' };
 enum { MODE_CM = 0, MODE_STORED = 1 };
 
+/* multi-block container "SQ01" (see docs/FORMAT.md):
+ *   [0..3]   magic "SQ01"
+ *   [4..11]  total original size, u64 little-endian
+ *   [12]     mode: 2 = multi-block
+ *   [13..16] chunk count k, u32 little-endian
+ *   [17..]   k * u32 LE: compressed size of each chunk
+ *   then     k chunks, each a complete SQ02 stream (own checksum/fallback)
+ * Chunks share no model state, so they compress and decompress in parallel. */
+static const u8 MAGIC_MB[4] = { 'S', 'Q', '0', '1' };
+enum { MODE_MB = 2 };
+#define MB_HDR_SIZE   17
+#define MB_MAX_CHUNKS 65536u    /* SQUISH_MAX_INPUT / SQUISH_MIN_CHUNK */
+
 /* ---------------- context: every bit of mutable state -------------------- */
 typedef struct squish_ctx {
     /* logistic tables (deterministic, built per context: no global state) */
@@ -401,6 +414,56 @@ static u64 get_le(const u8 *p, int nb) {
     return v;
 }
 
+/* ---------------- thread portability shim -------------------------------- */
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+typedef HANDLE            sq_thread;
+typedef CRITICAL_SECTION  sq_mutex;
+typedef DWORD             sq_thread_ret;
+#  define SQ_THREAD_CALL WINAPI
+#  define SQ_THREAD_DONE 0
+static void sq_mutex_init(sq_mutex *m)    { InitializeCriticalSection(m); }
+static void sq_mutex_destroy(sq_mutex *m) { DeleteCriticalSection(m); }
+static void sq_mutex_lock(sq_mutex *m)    { EnterCriticalSection(m); }
+static void sq_mutex_unlock(sq_mutex *m)  { LeaveCriticalSection(m); }
+typedef sq_thread_ret (SQ_THREAD_CALL *sq_thread_fn)(void *);
+static int sq_thread_start(sq_thread *t, sq_thread_fn fn, void *arg) {
+    *t = CreateThread(NULL, 0, fn, arg, 0, NULL);
+    return *t != NULL;
+}
+static void sq_thread_join(sq_thread t) {
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+}
+static int sq_ncpu(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+}
+#else
+#  include <pthread.h>
+#  include <unistd.h>
+typedef pthread_t        sq_thread;
+typedef pthread_mutex_t  sq_mutex;
+typedef void *           sq_thread_ret;
+#  define SQ_THREAD_CALL
+#  define SQ_THREAD_DONE NULL
+static void sq_mutex_init(sq_mutex *m)    { pthread_mutex_init(m, NULL); }
+static void sq_mutex_destroy(sq_mutex *m) { pthread_mutex_destroy(m); }
+static void sq_mutex_lock(sq_mutex *m)    { pthread_mutex_lock(m); }
+static void sq_mutex_unlock(sq_mutex *m)  { pthread_mutex_unlock(m); }
+typedef sq_thread_ret (*sq_thread_fn)(void *);
+static int sq_thread_start(sq_thread *t, sq_thread_fn fn, void *arg) {
+    return pthread_create(t, NULL, fn, arg) == 0;
+}
+static void sq_thread_join(sq_thread t) { pthread_join(t, NULL); }
+static int sq_ncpu(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+#endif
+
 /* ---------------- public API ---------------------------------------------*/
 SQUISH_API const char *squish_version(void) { return SQUISH_VERSION_STRING; }
 
@@ -425,7 +488,9 @@ SQUISH_API size_t squish_compress_bound(size_t src_len) {
 SQUISH_API int squish_decompressed_size(const void *src, size_t src_len,
                                         uint64_t *out_size) {
     if (!src || !out_size) return SQUISH_E_PARAM;
-    if (src_len < 12 || memcmp(src, MAGIC, 4) != 0) return SQUISH_E_FORMAT;
+    if (src_len < 12 ||
+        (memcmp(src, MAGIC, 4) != 0 && memcmp(src, MAGIC_MB, 4) != 0))
+        return SQUISH_E_FORMAT;
     *out_size = get_le((const u8*)src + 4, 8);
     return SQUISH_OK;
 }
@@ -488,10 +553,16 @@ SQUISH_API int squish_compress(const void *src, size_t src_len,
     return compress_ex(src, src_len, dst, dst_len, NULL, NULL);
 }
 
+static int decompress_mb_ex(const void *src, size_t src_len,
+                            void *dst, size_t *dst_len,
+                            int nthreads, squish_progress_fn cb, void *user);
+
 static int decompress_ex(const void *src, size_t src_len,
                          void *dst, size_t *dst_len,
                          squish_progress_fn cb, void *user) {
     if (!src || !dst_len || (!dst && *dst_len)) return SQUISH_E_PARAM;
+    if (src_len >= 4 && memcmp(src, MAGIC_MB, 4) == 0)
+        return decompress_mb_ex(src, src_len, dst, dst_len, 1, cb, user);
     if (src_len < OVERHEAD || memcmp(src, MAGIC, 4) != 0)
         return SQUISH_E_FORMAT;
     const u8 *s = (const u8*)src;
@@ -530,6 +601,282 @@ static int decompress_ex(const void *src, size_t src_len,
 SQUISH_API int squish_decompress(const void *src, size_t src_len,
                                  void *dst, size_t *dst_len) {
     return decompress_ex(src, src_len, dst, dst_len, NULL, NULL);
+}
+
+/* ---------------- multi-block engine -------------------------------------- */
+
+/* Fans per-chunk progress into one monotonic (processed, total) sequence;
+ * the mutex also serializes calls into the user's callback. */
+typedef struct {
+    squish_progress_fn cb; void *user;
+    u64 total, agg;
+    u64 *cdone;                 /* per-chunk bytes reported so far */
+    sq_mutex mu;
+} mt_prog;
+typedef struct { mt_prog *p; u32 idx; } chunk_prog;
+
+static void mt_prog_cb(u64 done, u64 total, void *user) {
+    chunk_prog *cp = (chunk_prog*)user;
+    mt_prog *p = cp->p;
+    (void)total;
+    sq_mutex_lock(&p->mu);
+    p->agg += done - p->cdone[cp->idx];
+    p->cdone[cp->idx] = done;
+    p->cb(p->agg, p->total, p->user);
+    sq_mutex_unlock(&p->mu);
+}
+
+static int mt_prog_init(mt_prog *p, squish_progress_fn cb, void *user,
+                        u64 total, u32 nchunks, chunk_prog **cps) {
+    *cps = NULL;
+    if (!cb) return 1;
+    p->cb = cb; p->user = user; p->total = total; p->agg = 0;
+    p->cdone = (u64*)calloc(nchunks, sizeof(u64));
+    *cps = (chunk_prog*)malloc((size_t)nchunks * sizeof(chunk_prog));
+    if (!p->cdone || !*cps) {
+        free(p->cdone); free(*cps); *cps = NULL;
+        return 0;
+    }
+    for (u32 i = 0; i < nchunks; i++) { (*cps)[i].p = p; (*cps)[i].idx = i; }
+    sq_mutex_init(&p->mu);
+    return 1;
+}
+static void mt_prog_destroy(mt_prog *p, chunk_prog *cps) {
+    if (!cps) return;
+    sq_mutex_destroy(&p->mu);
+    free(p->cdone); free(cps);
+}
+
+/* Workers take chunks i = tid, tid + T, ...: equal-sized chunks make static
+ * striding balance as well as a shared queue, with no synchronization. */
+typedef struct {
+    /* compress */
+    const u8 *src; u64 src_len, chunk;
+    u8 **bufs; size_t *lens;
+    /* decompress */
+    const u8 *s; u8 *dst;
+    const u64 *coff, *doff, *olen;
+    const u32 *clen;
+    /* shared */
+    int *rcs; chunk_prog *cps;
+    u32 nchunks, tid, nthreads;
+} mt_args;
+
+static sq_thread_ret SQ_THREAD_CALL compress_worker(void *arg) {
+    mt_args *a = (mt_args*)arg;
+    for (u32 i = a->tid; i < a->nchunks; i += a->nthreads) {
+        u64 off = (u64)i * a->chunk;
+        size_t len = (size_t)(a->chunk <= a->src_len - off ? a->chunk
+                                                           : a->src_len - off);
+        size_t outn = len + OVERHEAD;
+        a->bufs[i] = (u8*)malloc(outn);
+        if (!a->bufs[i]) { a->rcs[i] = SQUISH_E_NOMEM; continue; }
+        a->rcs[i] = compress_ex(a->src + off, len, a->bufs[i], &outn,
+                                a->cps ? mt_prog_cb : NULL,
+                                a->cps ? (void*)&a->cps[i] : NULL);
+        a->lens[i] = outn;
+    }
+    return SQ_THREAD_DONE;
+}
+
+static sq_thread_ret SQ_THREAD_CALL decompress_worker(void *arg) {
+    mt_args *a = (mt_args*)arg;
+    for (u32 i = a->tid; i < a->nchunks; i += a->nthreads) {
+        size_t dn = (size_t)a->olen[i];
+        a->rcs[i] = decompress_ex(a->s + a->coff[i], a->clen[i],
+                                  a->dst + a->doff[i], &dn,
+                                  a->cps ? mt_prog_cb : NULL,
+                                  a->cps ? (void*)&a->cps[i] : NULL);
+    }
+    return SQ_THREAD_DONE;
+}
+
+/* Run `fn` over `nchunks` chunks on `nthreads` threads (worker 0 runs on the
+ * calling thread; a failed spawn folds that stripe into the caller too). */
+static void mt_run(sq_thread_fn fn, mt_args *proto, u32 nthreads,
+                   mt_args *args, sq_thread *tids) {
+    u32 started = 0;
+    for (u32 t = 1; t < nthreads; t++) {
+        args[t] = *proto;
+        args[t].tid = t;
+        args[t].nthreads = nthreads;
+        if (sq_thread_start(&tids[started], fn, &args[t])) started++;
+        else { args[t].nthreads = 0; }          /* mark: run inline below */
+    }
+    args[0] = *proto;
+    args[0].tid = 0;
+    args[0].nthreads = nthreads;
+    fn(&args[0]);
+    for (u32 t = 1; t < nthreads; t++)
+        if (args[t].nthreads == 0) { args[t].nthreads = nthreads; fn(&args[t]); }
+    for (u32 t = 0; t < started; t++) sq_thread_join(tids[t]);
+}
+
+static int compress_mt_ex(const void *src, size_t src_len,
+                          void *dst, size_t *dst_len,
+                          int nthreads, size_t chunk_size,
+                          squish_progress_fn cb, void *user) {
+    if ((!src && src_len) || !dst || !dst_len) return SQUISH_E_PARAM;
+    if ((u64)src_len >= SQUISH_MAX_INPUT)      return SQUISH_E_TOOBIG;
+    u64 chunk = chunk_size ? chunk_size : SQUISH_DEFAULT_CHUNK;
+    if (chunk < SQUISH_MIN_CHUNK) chunk = SQUISH_MIN_CHUNK;
+    if ((u64)src_len <= chunk)
+        return compress_ex(src, src_len, dst, dst_len, cb, user);
+
+    u32 k = (u32)(((u64)src_len + chunk - 1) / chunk);
+    int T = nthreads > 0 ? nthreads : sq_ncpu();
+    if ((u32)T > k) T = (int)k;
+
+    u8    **bufs = (u8**)calloc(k, sizeof(u8*));
+    size_t *lens = (size_t*)calloc(k, sizeof(size_t));
+    int    *rcs  = (int*)calloc(k, sizeof(int));
+    mt_args *args = (mt_args*)calloc(T, sizeof(mt_args));
+    sq_thread *tids = (sq_thread*)calloc(T, sizeof(sq_thread));
+    mt_prog prog; chunk_prog *cps = NULL;
+    int rc = SQUISH_OK;
+    if (!bufs || !lens || !rcs || !args || !tids ||
+        !mt_prog_init(&prog, cb, user, src_len, k, &cps)) {
+        rc = SQUISH_E_NOMEM;
+        goto done;
+    }
+
+    {
+        mt_args proto;
+        memset(&proto, 0, sizeof proto);
+        proto.src = (const u8*)src; proto.src_len = src_len;
+        proto.chunk = chunk;
+        proto.bufs = bufs; proto.lens = lens;
+        proto.rcs = rcs; proto.cps = cps; proto.nchunks = k;
+        mt_run(compress_worker, &proto, (u32)T, args, tids);
+    }
+    for (u32 i = 0; i < k && rc == SQUISH_OK; i++) rc = rcs[i];
+    if (rc != SQUISH_OK) goto done;
+
+    {
+        size_t cap = *dst_len, stored_size = OVERHEAD + src_len;
+        u64 total = MB_HDR_SIZE + 4ull * k;
+        for (u32 i = 0; i < k; i++) total += lens[i];
+        u8 *d = (u8*)dst;
+        if (total < stored_size && total <= cap) {
+            memcpy(d, MAGIC_MB, 4);
+            put_le(d + 4, (u64)src_len, 8);
+            d[12] = MODE_MB;
+            put_le(d + 13, k, 4);
+            size_t w = MB_HDR_SIZE;
+            for (u32 i = 0; i < k; i++, w += 4) put_le(d + w, lens[i], 4);
+            for (u32 i = 0; i < k; i++) {
+                memcpy(d + w, bufs[i], lens[i]);
+                w += lens[i];
+            }
+            *dst_len = w;
+        } else if (stored_size <= cap) {
+            memcpy(d, MAGIC, 4);
+            put_le(d + 4, (u64)src_len, 8);
+            d[12] = MODE_STORED;
+            memcpy(d + HDR_SIZE, src, src_len);
+            put_le(d + HDR_SIZE + src_len,
+                   fnv1a64((const u8*)src, src_len) & 0xffffffff, 4);
+            *dst_len = stored_size;
+        } else rc = SQUISH_E_DSTSIZE;
+    }
+    if (rc == SQUISH_OK && cb) cb(src_len, src_len, user);
+
+done:
+    if (bufs) for (u32 i = 0; i < k; i++) free(bufs[i]);
+    mt_prog_destroy(&prog, cps);
+    free(bufs); free(lens); free(rcs); free(args); free(tids);
+    return rc;
+}
+
+static int decompress_mb_ex(const void *src, size_t src_len,
+                            void *dst, size_t *dst_len,
+                            int nthreads, squish_progress_fn cb, void *user) {
+    if (!src || !dst_len || (!dst && *dst_len)) return SQUISH_E_PARAM;
+    const u8 *s = (const u8*)src;
+    if (src_len < MB_HDR_SIZE + 4 || memcmp(s, MAGIC_MB, 4) != 0 ||
+        s[12] != MODE_MB)
+        return SQUISH_E_FORMAT;
+    u64 n = get_le(s + 4, 8);
+    u32 k = (u32)get_le(s + 13, 4);
+    if (n >= SQUISH_MAX_INPUT || k < 1 || k > MB_MAX_CHUNKS) return SQUISH_E_FORMAT;
+    u64 table_end = MB_HDR_SIZE + 4ull * k;
+    if (src_len < table_end) return SQUISH_E_FORMAT;
+    if (*dst_len < n) { *dst_len = (size_t)n; return SQUISH_E_DSTSIZE; }
+
+    u32 *clen = (u32*)malloc((size_t)k * sizeof(u32));
+    u64 *coff = (u64*)malloc((size_t)k * sizeof(u64));
+    u64 *doff = (u64*)malloc((size_t)k * sizeof(u64));
+    u64 *olen = (u64*)malloc((size_t)k * sizeof(u64));
+    int *rcs  = (int*)calloc(k, sizeof(int));
+    mt_args *args = NULL; sq_thread *tids = NULL;
+    mt_prog prog; chunk_prog *cps = NULL;
+    int rc = SQUISH_OK;
+    if (!clen || !coff || !doff || !olen || !rcs) { rc = SQUISH_E_NOMEM; goto done; }
+
+    {   /* chunk table: offsets must tile the payload and the output exactly;
+         * chunks must themselves be SQ02 (no recursive containers) */
+        u64 co = table_end, dof = 0;
+        for (u32 i = 0; i < k; i++) {
+            clen[i] = (u32)get_le(s + MB_HDR_SIZE + 4ull*i, 4);
+            coff[i] = co; doff[i] = dof;
+            if (clen[i] < OVERHEAD || clen[i] > src_len - co) {
+                rc = SQUISH_E_FORMAT; goto done;
+            }
+            if (memcmp(s + co, MAGIC, 4) != 0) { rc = SQUISH_E_FORMAT; goto done; }
+            olen[i] = get_le(s + co + 4, 8);
+            if (olen[i] > n - dof) { rc = SQUISH_E_FORMAT; goto done; }
+            co += clen[i]; dof += olen[i];
+        }
+        if (co != src_len || dof != n) { rc = SQUISH_E_FORMAT; goto done; }
+    }
+
+    {
+        int T = nthreads > 0 ? nthreads : sq_ncpu();
+        if ((u32)T > k) T = (int)k;
+        args = (mt_args*)calloc(T, sizeof(mt_args));
+        tids = (sq_thread*)calloc(T, sizeof(sq_thread));
+        if (!args || !tids || !mt_prog_init(&prog, cb, user, n, k, &cps)) {
+            rc = SQUISH_E_NOMEM; goto done;
+        }
+        mt_args proto;
+        memset(&proto, 0, sizeof proto);
+        proto.s = s; proto.dst = (u8*)dst;
+        proto.coff = coff; proto.doff = doff;
+        proto.olen = olen; proto.clen = clen;
+        proto.rcs = rcs; proto.cps = cps; proto.nchunks = k;
+        mt_run(decompress_worker, &proto, (u32)T, args, tids);
+    }
+    for (u32 i = 0; i < k && rc == SQUISH_OK; i++) rc = rcs[i];
+    if (rc == SQUISH_OK) {
+        *dst_len = (size_t)n;
+        if (cb) cb(n, n, user);
+    }
+
+done:
+    mt_prog_destroy(&prog, cps);
+    free(clen); free(coff); free(doff); free(olen); free(rcs);
+    free(args); free(tids);
+    return rc;
+}
+
+SQUISH_API int squish_threads(void) { return sq_ncpu(); }
+
+SQUISH_API int squish_compress_mt(const void *src, size_t src_len,
+                                  void *dst, size_t *dst_len,
+                                  int nthreads, size_t chunk_size,
+                                  squish_progress_fn progress, void *user) {
+    return compress_mt_ex(src, src_len, dst, dst_len,
+                          nthreads, chunk_size, progress, user);
+}
+
+SQUISH_API int squish_decompress_mt(const void *src, size_t src_len,
+                                    void *dst, size_t *dst_len,
+                                    int nthreads,
+                                    squish_progress_fn progress, void *user) {
+    if (src && src_len >= 4 && memcmp(src, MAGIC_MB, 4) == 0)
+        return decompress_mb_ex(src, src_len, dst, dst_len,
+                                nthreads, progress, user);
+    return decompress_ex(src, src_len, dst, dst_len, progress, user);
 }
 
 static int compress_alloc_ex(const void *src, size_t src_len,
@@ -575,6 +922,47 @@ static int decompress_alloc_ex(const void *src, size_t src_len,
 SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
                                        void **dst, size_t *dst_len) {
     return decompress_alloc_ex(src, src_len, dst, dst_len, NULL, NULL);
+}
+
+SQUISH_API int squish_compress_alloc_mt(const void *src, size_t src_len,
+                                        void **dst, size_t *dst_len,
+                                        int nthreads, size_t chunk_size,
+                                        squish_progress_fn progress,
+                                        void *user) {
+    if (!dst || !dst_len) return SQUISH_E_PARAM;
+    *dst = NULL; *dst_len = 0;
+    size_t cap = squish_compress_bound(src_len);
+    u8 *buf = (u8*)malloc(cap);
+    if (!buf) return SQUISH_E_NOMEM;
+    size_t out = cap;
+    int rc = compress_mt_ex(src, src_len, buf, &out,
+                            nthreads, chunk_size, progress, user);
+    if (rc != SQUISH_OK) { free(buf); return rc; }
+    u8 *trim = (u8*)realloc(buf, out ? out : 1);
+    *dst = trim ? trim : buf;
+    *dst_len = out;
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_decompress_alloc_mt(const void *src, size_t src_len,
+                                          void **dst, size_t *dst_len,
+                                          int nthreads,
+                                          squish_progress_fn progress,
+                                          void *user) {
+    if (!dst || !dst_len) return SQUISH_E_PARAM;
+    *dst = NULL; *dst_len = 0;
+    u64 n;
+    int rc = squish_decompressed_size(src, src_len, &n);
+    if (rc != SQUISH_OK) return rc;
+    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
+    u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
+    if (!buf) return SQUISH_E_NOMEM;
+    size_t out = (size_t)n;
+    rc = squish_decompress_mt(src, src_len, buf, &out,
+                              nthreads, progress, user);
+    if (rc != SQUISH_OK) { free(buf); return rc; }
+    *dst = buf; *dst_len = out;
+    return SQUISH_OK;
 }
 
 SQUISH_API void squish_free(void *p) { free(p); }
@@ -644,4 +1032,42 @@ SQUISH_API int squish_decompress_file2(const char *src_path,
 SQUISH_API int squish_decompress_file(const char *src_path,
                                       const char *dst_path) {
     return squish_decompress_file2(src_path, dst_path, NULL, NULL);
+}
+
+SQUISH_API int squish_compress_file_mt(const char *src_path,
+                                       const char *dst_path,
+                                       int nthreads, size_t chunk_size,
+                                       squish_progress_fn progress,
+                                       void *user) {
+    if (!src_path || !dst_path) return SQUISH_E_PARAM;
+    u8 *in; size_t n;
+    int rc = read_whole(src_path, &in, &n);
+    if (rc != SQUISH_OK) return rc;
+    void *out; size_t outn;
+    rc = squish_compress_alloc_mt(in, n, &out, &outn,
+                                  nthreads, chunk_size, progress, user);
+    free(in);
+    if (rc != SQUISH_OK) return rc;
+    rc = write_whole(dst_path, (const u8*)out, outn);
+    squish_free(out);
+    return rc;
+}
+
+SQUISH_API int squish_decompress_file_mt(const char *src_path,
+                                         const char *dst_path,
+                                         int nthreads,
+                                         squish_progress_fn progress,
+                                         void *user) {
+    if (!src_path || !dst_path) return SQUISH_E_PARAM;
+    u8 *in; size_t n;
+    int rc = read_whole(src_path, &in, &n);
+    if (rc != SQUISH_OK) return rc;
+    void *out; size_t outn;
+    rc = squish_decompress_alloc_mt(in, n, &out, &outn,
+                                    nthreads, progress, user);
+    free(in);
+    if (rc != SQUISH_OK) return rc;
+    rc = write_whole(dst_path, (const u8*)out, outn);
+    squish_free(out);
+    return rc;
 }

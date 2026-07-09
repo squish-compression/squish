@@ -34,6 +34,14 @@
  *   model state, so concurrent calls from different threads are safe as long
  *   as they do not share src/dst buffers.
  *
+ * Parallelism
+ *   The squish_*_mt functions split the input into independent chunks and
+ *   run one model per chunk across worker threads ("SQ01" multi-block
+ *   streams): near-linear speedup at a small ratio cost (each chunk's model
+ *   starts cold). Output depends only on the chunk size, never on the
+ *   thread count. Plain squish_decompress* reads both formats. Budget
+ *   ~150 MB of model memory per thread.
+ *
  * Integrity
  *   Every stream carries a 32-bit checksum (FNV-1a 64, folded) of the
  *   original data; squish_decompress verifies it and fails on mismatch.
@@ -92,6 +100,11 @@ typedef enum squish_status {
 
 /* Largest supported input, in bytes. */
 #define SQUISH_MAX_INPUT ((uint64_t)0xFFFFFFF0u)
+
+/* Chunk sizing for the multi-threaded functions. chunk_size = 0 selects the
+ * default; anything smaller than the minimum is raised to it. */
+#define SQUISH_DEFAULT_CHUNK ((size_t)16 << 20)   /* 16 MiB */
+#define SQUISH_MIN_CHUNK     ((size_t)64 << 10)   /* 64 KiB */
 
 /* --- introspection ------------------------------------------------------ */
 
@@ -171,6 +184,56 @@ SQUISH_API int squish_compress_file2(const char *src_path,
 SQUISH_API int squish_decompress_file2(const char *src_path,
                                        const char *dst_path,
                                        squish_progress_fn progress, void *user);
+
+/* --- multi-threaded (multi-block "SQ01" streams) -------------------------- */
+
+/* Number of processors online (>= 1). What nthreads = 0 selects below. */
+SQUISH_API int squish_threads(void);
+
+/* Compress src into an SQ01 multi-block stream: the input is split into
+ * chunk_size-byte chunks (0 = SQUISH_DEFAULT_CHUNK), each compressed as an
+ * independent SQ02 stream by a pool of nthreads workers (0 = all cores,
+ * 1 = run serially — the output is identical either way; only chunk_size
+ * shapes the stream). Inputs no larger than one chunk produce a plain SQ02
+ * stream. Buffer/return contract of squish_compress, including the
+ * squish_compress_bound guarantee (incompressible inputs fall back to a
+ * single stored-mode SQ02 stream).
+ *
+ * `progress` (may be NULL) is called as documented for squish_progress_fn;
+ * calls are serialized by the library but may come from worker threads. */
+SQUISH_API int squish_compress_mt(const void *src, size_t src_len,
+                                  void *dst, size_t *dst_len,
+                                  int nthreads, size_t chunk_size,
+                                  squish_progress_fn progress, void *user);
+
+/* Decompress an SQ01 or SQ02 stream, chunks in parallel where the format
+ * allows (nthreads as above). Buffer/return contract of squish_decompress. */
+SQUISH_API int squish_decompress_mt(const void *src, size_t src_len,
+                                    void *dst, size_t *dst_len,
+                                    int nthreads,
+                                    squish_progress_fn progress, void *user);
+
+/* Library-allocated-output and whole-file variants of the two above. */
+SQUISH_API int squish_compress_alloc_mt(const void *src, size_t src_len,
+                                        void **dst, size_t *dst_len,
+                                        int nthreads, size_t chunk_size,
+                                        squish_progress_fn progress,
+                                        void *user);
+SQUISH_API int squish_decompress_alloc_mt(const void *src, size_t src_len,
+                                          void **dst, size_t *dst_len,
+                                          int nthreads,
+                                          squish_progress_fn progress,
+                                          void *user);
+SQUISH_API int squish_compress_file_mt(const char *src_path,
+                                       const char *dst_path,
+                                       int nthreads, size_t chunk_size,
+                                       squish_progress_fn progress,
+                                       void *user);
+SQUISH_API int squish_decompress_file_mt(const char *src_path,
+                                         const char *dst_path,
+                                         int nthreads,
+                                         squish_progress_fn progress,
+                                         void *user);
 
 #ifdef __cplusplus
 }

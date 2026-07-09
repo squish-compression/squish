@@ -128,6 +128,59 @@ from the coding loop, so keep it cheap and do not call back into the
 library. `user` is passed through untouched. With `progress == NULL` these
 are identical to the plain versions.
 
+## Multi-threaded variants
+
+```c
+int squish_threads(void);
+```
+Number of processors online (>= 1); what `nthreads = 0` selects below.
+
+```c
+int squish_compress_mt(const void *src, size_t src_len,
+                       void *dst, size_t *dst_len,
+                       int nthreads, size_t chunk_size,
+                       squish_progress_fn progress, void *user);
+int squish_decompress_mt(const void *src, size_t src_len,
+                         void *dst, size_t *dst_len, int nthreads,
+                         squish_progress_fn progress, void *user);
+
+int squish_compress_alloc_mt(const void *src, size_t src_len,
+                             void **dst, size_t *dst_len,
+                             int nthreads, size_t chunk_size,
+                             squish_progress_fn progress, void *user);
+int squish_decompress_alloc_mt(const void *src, size_t src_len,
+                               void **dst, size_t *dst_len, int nthreads,
+                               squish_progress_fn progress, void *user);
+
+int squish_compress_file_mt(const char *src_path, const char *dst_path,
+                            int nthreads, size_t chunk_size,
+                            squish_progress_fn progress, void *user);
+int squish_decompress_file_mt(const char *src_path, const char *dst_path,
+                              int nthreads,
+                              squish_progress_fn progress, void *user);
+```
+
+Parallel counterparts of the functions above, with the same buffer,
+allocation, file, and progress contracts. Compression splits the input
+into `chunk_size`-byte chunks (`0` = `SQUISH_DEFAULT_CHUNK`, 16 MiB;
+minimum `SQUISH_MIN_CHUNK`, 64 KiB) and codes each independently on a pool
+of `nthreads` workers (`0` = all cores), emitting a multi-block `SQ01`
+stream — see [FORMAT.md](FORMAT.md) §1b. Points worth knowing:
+
+- **Output is deterministic**: it depends on the input and `chunk_size`
+  only, never on `nthreads`.
+- **Ratio cost**: each chunk's model starts cold, costing roughly 1–2% at
+  the 16 MiB default (more at smaller chunks). Inputs no larger than one
+  chunk produce a plain `SQ02` stream, bit-identical to `squish_compress`.
+- **Bound preserved**: `squish_compress_bound` still holds — inputs that
+  don't benefit fall back to a single stored-mode `SQ02` stream.
+- The decompression functions read both formats; parallelism applies to
+  `SQ01` streams (`SQ02` has a single sequential model). The plain
+  (non-`_mt`) decompression functions also accept `SQ01`, serially.
+- **Memory**: ~150 MB of model state per active worker.
+- `progress` calls are serialized by the library but may arrive on worker
+  threads; `processed` stays monotonic across the whole input.
+
 ---
 
 ## Linking recipes
@@ -150,7 +203,7 @@ From Python, load `libsquish.so` with `ctypes` directly —
 
 - The shared library uses semantic versioning; soname `libsquish.so.1`.
   Functions are added, never changed, within a major version.
-- The bitstream format is identified by the magic (`SQ02`). The model
-  constants in `squish.c` **are** the format: streams are only decodable by
-  a build with identical constants. `SQ02` readers reject other magics with
-  `SQUISH_E_FORMAT`.
+- The bitstream format is identified by the magic (`SQ02` single stream,
+  `SQ01` multi-block). The model constants in `squish.c` **are** the
+  format: streams are only decodable by a build with identical constants.
+  Readers reject other magics with `SQUISH_E_FORMAT`.

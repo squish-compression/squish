@@ -11,6 +11,18 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Added
 
+- Multi-threaded compression and decompression: new `SQ01` multi-block
+  container (independent `SQ02` chunk streams; see docs/FORMAT.md §1b) and
+  library functions `squish_compress_mt` / `squish_decompress_mt`, their
+  `_alloc_mt` / `_file_mt` variants, and `squish_threads()`. Output depends
+  only on the chunk size (default 16 MiB), never on the thread count, and
+  the `squish_compress_bound` guarantee is preserved. Existing
+  decompression entry points read `SQ01` streams transparently. (The
+  `SQ01` magic previously named an unreleased pre-1.0 draft no reader
+  accepted; it has been reassigned to the multi-block container.)
+- CLI: `-t N` / `--threads N` — 0 = all cores; compression defaults to 1,
+  keeping the ratio-optimal single-block format, decompression to all
+  cores — and `-b N` / `--block N` block size in MiB for `-t`
 - CLI: live status line on stderr (percent, bytes, throughput) while
   compressing/decompressing when stderr is a terminal; `-q`/`--quiet`
   suppresses the status line and the final summary (errors still print)
@@ -19,6 +31,13 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
   existing functions unchanged)
 - `build-windows.bat`: builds `squish.dll` + `squish.exe` with MSVC from a
   plain command prompt (locates Visual Studio via vswhere; no make needed)
+
+### Changed
+
+- CLI: the status line and summary now measure throughput on a wall clock
+  (was CPU time, which over-counts when threads are in play)
+- Building now requires a threads library: `-pthread` outside Windows
+  (added to the Makefile and pkg-config file), Win32 threads on Windows
 
 ## [1.0.0]
 

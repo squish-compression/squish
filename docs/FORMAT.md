@@ -1,10 +1,14 @@
-# SQUISH stream format "SQ02"
+# SQUISH stream formats "SQ02" and "SQ01"
 
 This document specifies the byte format completely enough to write an
 independent decoder. Because SQUISH is a context-mixing design, the
 container is trivial and the real specification is the **predictor**: the
 decoder must reproduce the encoder's probability for every bit exactly,
 which means every constant and update rule below is normative.
+
+There are two containers: `SQ02`, a single model stream, and `SQ01`
+(§1b), a multi-block wrapper holding independent `SQ02` streams so that
+chunks can be coded in parallel.
 
 ## 1. Container
 
@@ -23,6 +27,36 @@ last    4     checksum: FNV-1a 64 of the n original bytes, low 32 bits, LE
   stream would be at least as large (guaranteeing the n + 17 bound).
 - `mode 0`: payload is the arithmetic-coded bitstream described below.
 - FNV-1a 64: `h = 0xcbf29ce484222325; for each byte b: h ^= b; h *= 0x100000001b3`.
+
+## 1b. Multi-block container "SQ01"
+
+Produced by the multi-threaded encoder for inputs larger than one chunk.
+The payload is a sequence of complete, independent `SQ02` streams; models
+never carry state across chunk boundaries, which is what makes parallel
+encode and decode possible.
+
+```
+offset       size  field
+0            4     magic: 'S' 'Q' '0' '1'
+4            8     total original size n, unsigned 64-bit little-endian
+12           1     mode: 2 = multi-block
+13           4     chunk count k >= 1, unsigned 32-bit little-endian
+17           4*k   compressed size of each chunk, u32 LE each
+17 + 4*k     ...   k chunks, each a complete SQ02 stream (§1)
+```
+
+- Chunk i decodes to bytes `[sum of previous chunks' sizes ...)` of the
+  output; the original size of each chunk comes from its own SQ02 header.
+- The compressed sizes must tile the rest of the file exactly, and the
+  per-chunk original sizes must sum to n.
+- Chunks must be `SQ02` streams: nested `SQ01` containers are invalid.
+- There is no container-level checksum; each chunk carries its own (§1).
+- Encoders chunk the input at a fixed chunk size (encoder choice; the
+  reference default is 16 MiB, minimum 64 KiB), so the emitted stream
+  depends only on the input and the chunk size — never on the thread
+  count. An encoder that finds the multi-block stream no smaller than
+  stored mode emits a single stored-mode `SQ02` stream instead, which
+  preserves the n + 17 output bound.
 
 ## 2. Arithmetic coder
 
@@ -160,7 +194,10 @@ bit — predict, code, update, in that order, for encoder and decoder alike.
 
 ## 10. Versioning
 
-`SQ02` is the only current version. Any change to a constant, table size,
-initialization value, or update rule in §§2–9 produces incompatible streams
-and requires a new magic. (`SQ01` was a pre-release format without the mode
-byte and checksum; it is not accepted by `SQ02` readers.)
+`SQ02` (single stream) and `SQ01` (multi-block, §1b) are the current
+versions. Any change to a constant, table size, initialization value, or
+update rule in §§2–9 produces incompatible streams and requires a new
+magic. (The magic `SQ01` previously named a pre-release single-stream
+format without the mode byte and checksum; that format was never released
+and no reader accepted it, so the magic has been reassigned to the
+multi-block container, which is distinguishable by its mode byte 2.)

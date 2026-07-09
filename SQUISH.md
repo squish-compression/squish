@@ -72,6 +72,13 @@ payload · 32-bit checksum of the original data. Incompressible inputs fall
 back to stored mode, so output never exceeds input + 17 bytes; decompression
 verifies the checksum. Full byte-level spec: [docs/FORMAT.md](docs/FORMAT.md).
 
+The model pipeline is strictly sequential within a stream — every bit's
+prediction depends on the previous bit's update — so multi-core operation
+comes from cutting the input into chunks instead: an `"SQ01"` multi-block
+container wraps independent `SQ02` chunk streams that compress and
+decompress in parallel (`squish -t`, `squish_*_mt`), trading ~1–2% of
+ratio for near-linear speedup.
+
 ## Usage
 
 ```
