@@ -32,6 +32,17 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 - `build-windows.bat`: builds `squish.dll` + `squish.exe` with MSVC from a
   plain command prompt (locates Visual Studio via vswhere; no make needed)
 
+### Fixed
+
+- Undefined behavior: `memcpy` was called with a NULL pointer and length 0
+  when compressing empty input (`src == NULL, src_len == 0`, stored mode)
+  or decompressing an empty stored stream to a NULL destination; caught by
+  UBSan, now guarded
+- `squish_decompressed_size` now rejects headers claiming sizes at or above
+  `SQUISH_MAX_INPUT` (impossible for a valid stream) with
+  `SQUISH_E_FORMAT` instead of returning them, hardening callers that size
+  allocations from untrusted headers
+
 ### Changed
 
 - CLI: the status line and summary now measure throughput on a wall clock

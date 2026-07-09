@@ -47,7 +47,11 @@ static long long file_size(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     fseek(f, 0, SEEK_END);
-    long long n = ftell(f);
+#if defined(_WIN32)
+    long long n = _ftelli64(f);     /* ftell is 32-bit here: wrong past 2 GiB */
+#else
+    long long n = ftello(f);
+#endif
     fclose(f);
     return n;
 }
@@ -110,7 +114,8 @@ int main(int argc, char **argv) {
             if (++i >= argc) return usage();
             long v = strtol(argv[i], &end, 10);
             if (*end || v < 1 || v > 4096) return usage();
-            block = (size_t)v << 20;
+            if ((unsigned long)v > ((size_t)-1 >> 20)) return usage();
+            block = (size_t)v << 20;    /* MiB -> bytes, shift can't wrap */
         }
         else if (argv[i][0] == '-' && argv[i][1]) return usage();
         else if (npos < 3) pos[npos++] = argv[i];

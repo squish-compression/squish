@@ -36,3 +36,18 @@ Relevant vulnerability classes for this project include:
 Since SQUISH decompresses untrusted input in many use cases, crashes or
 memory-safety bugs triggered by malformed compressed streams are treated as
 security issues, not just correctness bugs.
+
+## Resource characteristics of decompression (by design)
+
+Callers feeding untrusted streams to the `*_alloc`/file helpers should know:
+
+- The output allocation is controlled by the stream header, up to the
+  format limit of 4 GiB − 16 bytes. Check `squish_decompressed_size()`
+  first and refuse sizes your application cannot afford.
+- Model state costs ~150 MB per active (de)compression — times the thread
+  count for the `_mt` functions.
+- Context mixing has no compression-ratio ceiling, so a tiny valid stream
+  legitimately expanding to gigabytes (e.g. compressed zeros) cannot be
+  distinguished from a bomb by ratio alone; the size pre-check above is the
+  supported guard. Truncated or forged streams that starve the decoder are
+  detected and rejected early rather than decoded to the claimed length.

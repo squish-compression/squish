@@ -123,7 +123,10 @@ SQUISH_API size_t squish_compress_bound(size_t src_len);
 
 /* Read the original (decompressed) size from a compressed buffer header.
  * Needs only the first 12 bytes. Returns SQUISH_OK and sets *out_size, or
- * SQUISH_E_FORMAT / SQUISH_E_PARAM. */
+ * SQUISH_E_FORMAT / SQUISH_E_PARAM. Headers claiming SQUISH_MAX_INPUT or
+ * more (impossible for a valid stream) are rejected as SQUISH_E_FORMAT.
+ * Note the size is a claim by the stream's producer: when sizing an
+ * allocation from untrusted input, impose your own limit as well. */
 SQUISH_API int squish_decompressed_size(const void *src, size_t src_len,
                                         uint64_t *out_size);
 

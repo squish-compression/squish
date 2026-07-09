@@ -136,6 +136,7 @@ typedef struct squish_ctx {
     /* arithmetic coder + buffer I/O */
     u32   x1, x2, x;
     const u8 *in; size_t in_pos, in_end;      /* decode source */
+    size_t starved;                           /* filler bytes read past end */
     u8   *out; size_t out_pos, out_cap;       /* encode sink   */
     int   overflow;
 } Ctx;
@@ -170,7 +171,9 @@ static inline void sink_put(Ctx *S, u8 b) {
     else S->overflow = 1;
 }
 static inline int src_get(Ctx *S) {           /* 255 past end, like EOF */
-    return S->in_pos < S->in_end ? S->in[S->in_pos++] : 255;
+    if (S->in_pos < S->in_end) return S->in[S->in_pos++];
+    S->starved++;
+    return 255;
 }
 static void enc_init(Ctx *S) { S->x1 = 0; S->x2 = 0xffffffff; }
 static inline void enc_bit(Ctx *S, int y, int p16) {
@@ -491,7 +494,9 @@ SQUISH_API int squish_decompressed_size(const void *src, size_t src_len,
     if (src_len < 12 ||
         (memcmp(src, MAGIC, 4) != 0 && memcmp(src, MAGIC_MB, 4) != 0))
         return SQUISH_E_FORMAT;
-    *out_size = get_le((const u8*)src + 4, 8);
+    u64 n = get_le((const u8*)src + 4, 8);
+    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
+    *out_size = n;
     return SQUISH_OK;
 }
 
@@ -541,7 +546,7 @@ static int compress_ex(const void *src, size_t src_len,
     /* incompressible: store raw if there is room */
     if (cap < stored_size) return SQUISH_E_DSTSIZE;
     d[12] = MODE_STORED;
-    memcpy(d + HDR_SIZE, src, src_len);
+    if (src_len) memcpy(d + HDR_SIZE, src, src_len);
     put_le(d + HDR_SIZE + src_len, cks & 0xffffffff, 4);
     *dst_len = stored_size;
     if (cb) cb(src_len, src_len, user);
@@ -575,13 +580,20 @@ static int decompress_ex(const void *src, size_t src_len,
 
     if (mode == MODE_STORED) {
         if (src_len != OVERHEAD + n) return SQUISH_E_FORMAT;
-        memcpy(dst, s + HDR_SIZE, (size_t)n);
+        if (n) memcpy(dst, s + HDR_SIZE, (size_t)n);
     } else {
         Ctx *S = ctx_new((u8*)dst, /*buf_write=*/1);
         if (!S) return SQUISH_E_NOMEM;
         S->in = s; S->in_pos = HDR_SIZE; S->in_end = src_len - CKS_SIZE;
         dec_init(S);
         for (u64 j = 0; j < n; j++) {
+            /* The decoder of a well-formed stream consumes exactly the bytes
+             * the encoder emitted, never the past-end filler. Sustained
+             * filler reads mean the stream is truncated or forged; bail
+             * instead of decoding up to 4 GiB of noise (a ~20-byte forged
+             * header would otherwise cost hours of CPU before the checksum
+             * finally rejects it). */
+            if (S->starved > 64) { ctx_free(S); return SQUISH_E_FORMAT; }
             if (cb && (j & 0xFFFFu) == 0) cb(j, n, user);
             for (int i = 7; i >= 0; i--) {
                 int pr = predict(S);
@@ -773,7 +785,7 @@ static int compress_mt_ex(const void *src, size_t src_len,
             memcpy(d, MAGIC, 4);
             put_le(d + 4, (u64)src_len, 8);
             d[12] = MODE_STORED;
-            memcpy(d + HDR_SIZE, src, src_len);
+            if (src_len) memcpy(d + HDR_SIZE, src, src_len);
             put_le(d + HDR_SIZE + src_len,
                    fnv1a64((const u8*)src, src_len) & 0xffffffff, 4);
             *dst_len = stored_size;
@@ -824,7 +836,10 @@ static int decompress_mb_ex(const void *src, size_t src_len,
             }
             if (memcmp(s + co, MAGIC, 4) != 0) { rc = SQUISH_E_FORMAT; goto done; }
             olen[i] = get_le(s + co + 4, 8);
-            if (olen[i] > n - dof) { rc = SQUISH_E_FORMAT; goto done; }
+            /* no encoder emits empty chunks; rejecting them stops a forged
+             * table from demanding 64k pointless model setups (~150 MB of
+             * table init each) for zero output */
+            if (olen[i] == 0 || olen[i] > n - dof) { rc = SQUISH_E_FORMAT; goto done; }
             co += clen[i]; dof += olen[i];
         }
         if (co != src_len || dof != n) { rc = SQUISH_E_FORMAT; goto done; }
@@ -968,12 +983,23 @@ SQUISH_API int squish_decompress_alloc_mt(const void *src, size_t src_len,
 SQUISH_API void squish_free(void *p) { free(p); }
 
 /* ---------------- file helpers ------------------------------------------- */
+
+/* 64-bit stream offsets: plain ftell returns long, which is 32-bit on
+ * Windows — a >=2 GiB input would be mis-sized (and on a 32-bit size_t the
+ * cast below could silently truncate what gets compressed). */
+#if defined(_WIN32)
+#  define sq_ftell64(f) _ftelli64(f)
+#else
+#  define sq_ftell64(f) ftello(f)
+#endif
+
 static int read_whole(const char *path, u8 **data, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return SQUISH_E_IO;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return SQUISH_E_IO; }
-    long long n = ftell(f);
+    long long n = sq_ftell64(f);
     if (n < 0) { fclose(f); return SQUISH_E_IO; }
+    if ((unsigned long long)n > (size_t)-1) { fclose(f); return SQUISH_E_TOOBIG; }
     rewind(f);
     u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
     if (!buf) { fclose(f); return SQUISH_E_NOMEM; }

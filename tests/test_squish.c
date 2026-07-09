@@ -47,6 +47,10 @@ static void progress_probe(uint64_t processed, uint64_t total, void *user) {
     progress_state.total = total;
 }
 
+static void wr_le(uint8_t *p, uint64_t v, int nb) {
+    for (int i = 0; i < nb; i++) p[i] = (uint8_t)(v >> (8*i));
+}
+
 static void roundtrip(const uint8_t *data, size_t n, const char *name) {
     void *c = NULL, *d = NULL;
     size_t cn = 0, dn = 0;
@@ -228,6 +232,83 @@ int main(void) {
         CHECK(rc == SQUISH_OK && memcmp(buf, "SQ02", 4) == 0,
               "compress_mt small input emits SQ02");
         CHECK(squish_threads() >= 1, "squish_threads");
+    }
+    {   /* malformed containers: every case must fail cleanly, never crash */
+        static uint8_t t[150000];
+        for (size_t i = 0; i < sizeof t; i++)
+            t[i] = (uint8_t)("squish stress "[i % 14]);
+        void *c = NULL; size_t cn = 0;
+        int rc = squish_compress_alloc_mt(t, sizeof t, &c, &cn,
+                                          2, SQUISH_MIN_CHUNK, NULL, NULL);
+        CHECK(rc == SQUISH_OK && cn > 21 && memcmp(c, "SQ01", 4) == 0,
+              "malformed-container template");
+        uint8_t *m = (uint8_t*)malloc(cn);
+        void *d = NULL; size_t dn = 0;
+        int ok = 1;
+
+        /* chunk count out of range: 0 and huge */
+        memcpy(m, c, cn); wr_le(m + 13, 0, 4);
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        memcpy(m, c, cn); wr_le(m + 13, 0xFFFFFFFFu, 4);
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        CHECK(ok, "  bad chunk count rejected");
+
+        /* chunk table that does not tile the payload */
+        memcpy(m, c, cn); wr_le(m + 17, 0, 4);
+        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        memcpy(m, c, cn); wr_le(m + 17, 0xFFFFFFF0u, 4);
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        CHECK(ok, "  bad chunk table rejected");
+
+        /* total size that disagrees with the chunks' own sizes */
+        memcpy(m, c, cn); wr_le(m + 4, sizeof t + 1, 8);
+        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        memcpy(m, c, cn); wr_le(m + 4, sizeof t - 1, 8);
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        CHECK(ok, "  header size mismatch rejected");
+
+        /* size field past the format limit must be rejected up front */
+        memcpy(m, c, cn); wr_le(m + 4, ~0ull, 8);
+        uint64_t hn;
+        ok = squish_decompressed_size(m, cn, &hn) == SQUISH_E_FORMAT;
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) != SQUISH_OK;
+        CHECK(ok, "  oversize header rejected");
+
+        /* nested SQ01 chunk and bad mode bytes */
+        uint32_t k = ((uint8_t*)c)[13] | ((uint32_t)((uint8_t*)c)[14] << 8) |
+                     ((uint32_t)((uint8_t*)c)[15] << 16) |
+                     ((uint32_t)((uint8_t*)c)[16] << 24);
+        memcpy(m, c, cn); memcpy(m + 17 + 4 * (size_t)k, "SQ01", 4);
+        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        memcpy(m, c, cn); m[12] = 0;
+        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
+        CHECK(ok, "  nested container / bad mode rejected");
+
+        free(m); squish_free(c);
+    }
+    {   /* resource hardening: forged streams must fail fast, not chew CPU */
+        void *d = NULL; size_t dn = 0;
+        /* 17-byte stream claiming 16 MB of output with no payload: the
+         * decoder must notice input starvation immediately instead of
+         * decoding megabytes of filler noise before the checksum fails */
+        uint8_t hdr[17];
+        memset(hdr, 0, sizeof hdr);
+        memcpy(hdr, "SQ02", 4);
+        wr_le(hdr + 4, 1u << 24, 8);
+        CHECK(squish_decompress_alloc(hdr, sizeof hdr, &d, &dn)
+              == SQUISH_E_FORMAT, "starved stream rejected early");
+        /* SQ01 whose chunks all claim zero output: no encoder emits these,
+         * and each would cost a full model setup for nothing */
+        uint8_t mb[59];
+        memset(mb, 0, sizeof mb);
+        memcpy(mb, "SQ01", 4);
+        mb[12] = 2;
+        wr_le(mb + 13, 2, 4);                       /* k = 2            */
+        wr_le(mb + 17, 17, 4); wr_le(mb + 21, 17, 4);   /* chunk sizes  */
+        memcpy(mb + 25, "SQ02", 4); mb[25 + 12] = 1;    /* empty stored */
+        memcpy(mb + 42, "SQ02", 4); mb[42 + 12] = 1;
+        CHECK(squish_decompress_alloc(mb, sizeof mb, &d, &dn)
+              == SQUISH_E_FORMAT, "zero-length chunks rejected");
     }
     {   /* progress-reporting file helpers */
         const char *tmp_in  = "tests/.t_in";
