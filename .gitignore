@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+/squish
+tests/test_squish
+tools/squish-ref
+
+# Large corpus/benchmark data (fetched separately, not tracked)
+corpus/canterbury/
+corpus/edge/
+corpus/silesia/
+corpus/enwik8
+corpus/*.zip
+corpus/*.tar.gz
+tools/rar
+tools/rar.tar.gz
