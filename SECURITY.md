@@ -9,7 +9,7 @@ Security fixes are made against `main`; please use the latest commit.
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Instead, report it privately by emailing **wiley14@gmail.com** with:
+Instead, report it privately by emailing **paige@paigejulianne.com** with:
 
 - A description of the vulnerability and its potential impact
 - Steps to reproduce (a minimal input file or code snippet is ideal)
