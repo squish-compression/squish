@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build library + CLI
+        run: make CC=${{ matrix.cc }}
+
+      - name: Run test suite
+        run: make test CC=${{ matrix.cc }}
+
+      - name: Build example
+        run: make example CC=${{ matrix.cc }}
+
+      - name: Run example
+        run: |
+          LD_LIBRARY_PATH=. ./examples/example
+
+  windows-cross:
+    name: cross-compile Windows DLL + CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Build squish.dll + squish.exe
+        run: make dll MINGW=x86_64-w64-mingw32-gcc MINGW_AR=x86_64-w64-mingw32-ar
+
+      - name: Check artifacts exist
+        run: test -f squish.dll && test -f squish.exe && test -f libsquish.dll.a
