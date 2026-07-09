@@ -9,23 +9,6 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ## [Unreleased]
 
-### Added
-
-- `LICENSE` (GPLv3)
-- `CONTRIBUTING.md`
-- `.github/CODEOWNERS`
-- `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1)
-- `SECURITY.md`
-- `.github/PULL_REQUEST_TEMPLATE.md`
-- `.github/ISSUE_TEMPLATE/` (bug report, feature request)
-- `CHANGELOG.md`
-- `make dll` now also cross-compiles `squish.exe` (statically linked
-  against a mingw-built `libsquish-win.a`), not just `squish.dll`
-- `.github/workflows/ci.yml`: build + test on gcc/clang, plus a
-  mingw-w64 cross-compile check of `make dll`
-- `make windows-dll`: builds `squish.dll` + `squish.exe` with MSVC
-  (`cl.exe`), for native Windows builds without mingw
-
 ## [1.0.0]
 
 ### Added
@@ -45,6 +28,16 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 - API reference ([docs/API.md](docs/API.md)) and format specification
   ([docs/FORMAT.md](docs/FORMAT.md))
 - Algorithm design document ([SQUISH.md](SQUISH.md))
+- Project meta: `LICENSE` (GPLv3) with per-file copyright headers,
+  `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1),
+  `SECURITY.md`, `CHANGELOG.md`, `.github/` CODEOWNERS, PR and issue
+  templates
+- CI (`.github/workflows/ci.yml`): build + test on gcc/clang, plus a
+  mingw-w64 cross-compile check of `make dll`
+- `make dll` cross-compiles both `squish.dll` and `squish.exe`
+  (statically linked against a mingw-built `libsquish-win.a`)
+- `make windows-dll`: builds `squish.dll` + `squish.exe` with MSVC
+  (`cl.exe`), for native Windows builds without mingw
 
 [Unreleased]: https://github.com/paigejulianne/squish/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/paigejulianne/squish/releases/tag/v1.0.0
