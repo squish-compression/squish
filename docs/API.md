@@ -112,6 +112,22 @@ Whole-file convenience wrappers (read fully into memory, process, write;
 `dst_path` is overwritten). All buffer-level errors pass through;
 `SQUISH_E_IO` covers filesystem trouble.
 
+```c
+typedef void (*squish_progress_fn)(uint64_t processed, uint64_t total,
+                                   void *user);
+
+int squish_compress_file2(const char *src_path, const char *dst_path,
+                          squish_progress_fn progress, void *user);
+int squish_decompress_file2(const char *src_path, const char *dst_path,
+                            squish_progress_fn progress, void *user);
+```
+As above, plus progress reporting: `progress` (if non-NULL) is invoked with
+the count of original — uncompressed — bytes processed so far, every 64 KiB
+of progress and once with `processed == total` on completion. It is called
+from the coding loop, so keep it cheap and do not call back into the
+library. `user` is passed through untouched. With `progress == NULL` these
+are identical to the plain versions.
+
 ---
 
 ## Linking recipes

@@ -156,6 +156,22 @@ SQUISH_API int squish_compress_file(const char *src_path,
 SQUISH_API int squish_decompress_file(const char *src_path,
                                       const char *dst_path);
 
+/* Progress reporting. `processed` counts bytes of ORIGINAL (uncompressed)
+ * data handled so far, out of `total`; invoked every 64 KiB of progress and
+ * once with processed == total on completion. Called from the coding loop:
+ * keep it cheap, and do not call back into the library from it. */
+typedef void (*squish_progress_fn)(uint64_t processed, uint64_t total,
+                                   void *user);
+
+/* As squish_{,de}compress_file, additionally reporting progress through
+ * `progress` (may be NULL, which is equivalent to the plain versions). */
+SQUISH_API int squish_compress_file2(const char *src_path,
+                                     const char *dst_path,
+                                     squish_progress_fn progress, void *user);
+SQUISH_API int squish_decompress_file2(const char *src_path,
+                                       const char *dst_path,
+                                       squish_progress_fn progress, void *user);
+
 #ifdef __cplusplus
 }
 #endif

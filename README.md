@@ -50,6 +50,10 @@ No dependencies beyond libc/libm.
 ./squish d bigfile.sq restored    # decompress (checksum-verified)
 ```
 
+When stderr is a terminal, a live status line (percent, bytes, throughput)
+is shown while working, followed by a one-line summary. Pass `-q` /
+`--quiet` to suppress both; errors are still reported.
+
 ## Library
 
 C (see [examples/example.c](examples/example.c), full reference in

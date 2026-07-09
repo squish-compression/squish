@@ -430,8 +430,9 @@ SQUISH_API int squish_decompressed_size(const void *src, size_t src_len,
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_compress(const void *src, size_t src_len,
-                               void *dst, size_t *dst_len) {
+static int compress_ex(const void *src, size_t src_len,
+                       void *dst, size_t *dst_len,
+                       squish_progress_fn cb, void *user) {
     if ((!src && src_len) || !dst || !dst_len) return SQUISH_E_PARAM;
     if ((u64)src_len >= SQUISH_MAX_INPUT)      return SQUISH_E_TOOBIG;
     size_t cap = *dst_len;
@@ -451,6 +452,7 @@ SQUISH_API int squish_compress(const void *src, size_t src_len,
     S->out_cap = cm_cap;
     enc_init(S);
     for (size_t j = 0; j < src_len && !S->overflow; j++) {
+        if (cb && (j & 0xFFFFu) == 0) cb(j, src_len, user);
         u8 b = ((const u8*)src)[j];
         for (int i = 7; i >= 0; i--) {
             int y = (b >> i) & 1;
@@ -468,6 +470,7 @@ SQUISH_API int squish_compress(const void *src, size_t src_len,
         d[12] = MODE_CM;
         put_le(d + HDR_SIZE + coded, cks & 0xffffffff, 4);
         *dst_len = HDR_SIZE + coded + CKS_SIZE;
+        if (cb) cb(src_len, src_len, user);
         return SQUISH_OK;
     }
     /* incompressible: store raw if there is room */
@@ -476,11 +479,18 @@ SQUISH_API int squish_compress(const void *src, size_t src_len,
     memcpy(d + HDR_SIZE, src, src_len);
     put_le(d + HDR_SIZE + src_len, cks & 0xffffffff, 4);
     *dst_len = stored_size;
+    if (cb) cb(src_len, src_len, user);
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_decompress(const void *src, size_t src_len,
-                                 void *dst, size_t *dst_len) {
+SQUISH_API int squish_compress(const void *src, size_t src_len,
+                               void *dst, size_t *dst_len) {
+    return compress_ex(src, src_len, dst, dst_len, NULL, NULL);
+}
+
+static int decompress_ex(const void *src, size_t src_len,
+                         void *dst, size_t *dst_len,
+                         squish_progress_fn cb, void *user) {
     if (!src || !dst_len || (!dst && *dst_len)) return SQUISH_E_PARAM;
     if (src_len < OVERHEAD || memcmp(src, MAGIC, 4) != 0)
         return SQUISH_E_FORMAT;
@@ -501,6 +511,7 @@ SQUISH_API int squish_decompress(const void *src, size_t src_len,
         S->in = s; S->in_pos = HDR_SIZE; S->in_end = src_len - CKS_SIZE;
         dec_init(S);
         for (u64 j = 0; j < n; j++) {
+            if (cb && (j & 0xFFFFu) == 0) cb(j, n, user);
             for (int i = 7; i >= 0; i--) {
                 int pr = predict(S);
                 int y = dec_bit(S, (pr << 4) | 8);
@@ -512,18 +523,25 @@ SQUISH_API int squish_decompress(const void *src, size_t src_len,
     if ((u32)(fnv1a64((const u8*)dst, (size_t)n) & 0xffffffff) != want)
         return SQUISH_E_CHECKSUM;
     *dst_len = (size_t)n;
+    if (cb) cb(n, n, user);
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_compress_alloc(const void *src, size_t src_len,
-                                     void **dst, size_t *dst_len) {
+SQUISH_API int squish_decompress(const void *src, size_t src_len,
+                                 void *dst, size_t *dst_len) {
+    return decompress_ex(src, src_len, dst, dst_len, NULL, NULL);
+}
+
+static int compress_alloc_ex(const void *src, size_t src_len,
+                             void **dst, size_t *dst_len,
+                             squish_progress_fn cb, void *user) {
     if (!dst || !dst_len) return SQUISH_E_PARAM;
     *dst = NULL; *dst_len = 0;
     size_t cap = squish_compress_bound(src_len);
     u8 *buf = (u8*)malloc(cap);
     if (!buf) return SQUISH_E_NOMEM;
     size_t out = cap;
-    int rc = squish_compress(src, src_len, buf, &out);
+    int rc = compress_ex(src, src_len, buf, &out, cb, user);
     if (rc != SQUISH_OK) { free(buf); return rc; }
     u8 *trim = (u8*)realloc(buf, out ? out : 1);
     *dst = trim ? trim : buf;
@@ -531,8 +549,14 @@ SQUISH_API int squish_compress_alloc(const void *src, size_t src_len,
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
-                                       void **dst, size_t *dst_len) {
+SQUISH_API int squish_compress_alloc(const void *src, size_t src_len,
+                                     void **dst, size_t *dst_len) {
+    return compress_alloc_ex(src, src_len, dst, dst_len, NULL, NULL);
+}
+
+static int decompress_alloc_ex(const void *src, size_t src_len,
+                               void **dst, size_t *dst_len,
+                               squish_progress_fn cb, void *user) {
     if (!dst || !dst_len) return SQUISH_E_PARAM;
     *dst = NULL; *dst_len = 0;
     u64 n;
@@ -542,10 +566,15 @@ SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
     u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
     if (!buf) return SQUISH_E_NOMEM;
     size_t out = (size_t)n;
-    rc = squish_decompress(src, src_len, buf, &out);
+    rc = decompress_ex(src, src_len, buf, &out, cb, user);
     if (rc != SQUISH_OK) { free(buf); return rc; }
     *dst = buf; *dst_len = out;
     return SQUISH_OK;
+}
+
+SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
+                                       void **dst, size_t *dst_len) {
+    return decompress_alloc_ex(src, src_len, dst, dst_len, NULL, NULL);
 }
 
 SQUISH_API void squish_free(void *p) { free(p); }
@@ -574,14 +603,37 @@ static int write_whole(const char *path, const u8 *data, size_t len) {
     return fclose(f) == 0 ? SQUISH_OK : SQUISH_E_IO;
 }
 
-SQUISH_API int squish_compress_file(const char *src_path,
-                                    const char *dst_path) {
+SQUISH_API int squish_compress_file2(const char *src_path,
+                                     const char *dst_path,
+                                     squish_progress_fn progress, void *user) {
     if (!src_path || !dst_path) return SQUISH_E_PARAM;
     u8 *in; size_t n;
     int rc = read_whole(src_path, &in, &n);
     if (rc != SQUISH_OK) return rc;
     void *out; size_t outn;
-    rc = squish_compress_alloc(in, n, &out, &outn);
+    rc = compress_alloc_ex(in, n, &out, &outn, progress, user);
+    free(in);
+    if (rc != SQUISH_OK) return rc;
+    rc = write_whole(dst_path, (const u8*)out, outn);
+    squish_free(out);
+    return rc;
+}
+
+SQUISH_API int squish_compress_file(const char *src_path,
+                                    const char *dst_path) {
+    return squish_compress_file2(src_path, dst_path, NULL, NULL);
+}
+
+SQUISH_API int squish_decompress_file2(const char *src_path,
+                                       const char *dst_path,
+                                       squish_progress_fn progress,
+                                       void *user) {
+    if (!src_path || !dst_path) return SQUISH_E_PARAM;
+    u8 *in; size_t n;
+    int rc = read_whole(src_path, &in, &n);
+    if (rc != SQUISH_OK) return rc;
+    void *out; size_t outn;
+    rc = decompress_alloc_ex(in, n, &out, &outn, progress, user);
     free(in);
     if (rc != SQUISH_OK) return rc;
     rc = write_whole(dst_path, (const u8*)out, outn);
@@ -591,15 +643,5 @@ SQUISH_API int squish_compress_file(const char *src_path,
 
 SQUISH_API int squish_decompress_file(const char *src_path,
                                       const char *dst_path) {
-    if (!src_path || !dst_path) return SQUISH_E_PARAM;
-    u8 *in; size_t n;
-    int rc = read_whole(src_path, &in, &n);
-    if (rc != SQUISH_OK) return rc;
-    void *out; size_t outn;
-    rc = squish_decompress_alloc(in, n, &out, &outn);
-    free(in);
-    if (rc != SQUISH_OK) return rc;
-    rc = write_whole(dst_path, (const u8*)out, outn);
-    squish_free(out);
-    return rc;
+    return squish_decompress_file2(src_path, dst_path, NULL, NULL);
 }

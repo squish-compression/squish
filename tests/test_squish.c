@@ -34,6 +34,19 @@ static uint8_t rnd(void) {
     return (uint8_t)((rng * 0x2545F4914F6CDD1Dull) >> 56);
 }
 
+static struct {
+    int calls, monotonic;
+    uint64_t done, total;
+} progress_state = { 0, 1, 0, 0 };
+
+static void progress_probe(uint64_t processed, uint64_t total, void *user) {
+    (void)user;
+    if (processed < progress_state.done) progress_state.monotonic = 0;
+    progress_state.calls++;
+    progress_state.done = processed;
+    progress_state.total = total;
+}
+
 static void roundtrip(const uint8_t *data, size_t n, const char *name) {
     void *c = NULL, *d = NULL;
     size_t cn = 0, dn = 0;
@@ -151,6 +164,31 @@ int main(void) {
         CHECK(same, "file round-trip identical");
         CHECK(squish_compress_file("tests/.does_not_exist", tmp_sq)
               == SQUISH_E_IO, "missing input file");
+        remove(tmp_in); remove(tmp_sq); remove(tmp_out);
+    }
+    {   /* progress-reporting file helpers */
+        const char *tmp_in  = "tests/.t_in";
+        const char *tmp_sq  = "tests/.t_sq";
+        const char *tmp_out = "tests/.t_out";
+        FILE *f = fopen(tmp_in, "wb");
+        for (int i = 0; i < 200000; i++) fputc((i * 31) & 255, f);
+        fclose(f);
+        CHECK(squish_compress_file2(tmp_in, tmp_sq,
+                                    progress_probe, &progress_state)
+              == SQUISH_OK, "compress_file2");
+        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
+              progress_state.done == progress_state.total &&
+              progress_state.total == 200000,
+              "  compress progress reported");
+        memset(&progress_state, 0, sizeof progress_state);
+        progress_state.monotonic = 1;
+        CHECK(squish_decompress_file2(tmp_sq, tmp_out,
+                                      progress_probe, &progress_state)
+              == SQUISH_OK, "decompress_file2");
+        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
+              progress_state.done == progress_state.total &&
+              progress_state.total == 200000,
+              "  decompress progress reported");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
     }
 

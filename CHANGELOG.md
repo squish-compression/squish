@@ -11,6 +11,12 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Added
 
+- CLI: live status line on stderr (percent, bytes, throughput) while
+  compressing/decompressing when stderr is a terminal; `-q`/`--quiet`
+  suppresses the status line and the final summary (errors still print)
+- Library: `squish_progress_fn` callback type and progress-reporting file
+  helpers `squish_compress_file2` / `squish_decompress_file2` (additive;
+  existing functions unchanged)
 - `build-windows.bat`: builds `squish.dll` + `squish.exe` with MSVC from a
   plain command prompt (locates Visual Studio via vswhere; no make needed)
 
