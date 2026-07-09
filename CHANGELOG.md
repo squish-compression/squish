@@ -21,6 +21,10 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 - `CHANGELOG.md`
 - `make dll` now also cross-compiles `squish.exe` (statically linked
   against a mingw-built `libsquish-win.a`), not just `squish.dll`
+- `.github/workflows/ci.yml`: build + test on gcc/clang, plus a
+  mingw-w64 cross-compile check of `make dll`
+- `make windows-dll`: builds `squish.dll` + `squish.exe` with MSVC
+  (`cl.exe`), for native Windows builds without mingw
 
 ## [1.0.0]
 

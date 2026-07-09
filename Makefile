@@ -4,6 +4,8 @@
 #   make            build libsquish.so, libsquish.a, and the squish CLI
 #   make test       build + run the test suite
 #   make dll        cross-compile squish.dll + squish.exe (needs mingw-w64)
+#   make windows-dll   build squish.dll + squish.exe with MSVC (needs cl.exe
+#                       on PATH, e.g. a VS "Developer Command Prompt")
 #   make install    install to $(PREFIX) (default /usr/local)
 #   make clean
 
@@ -20,6 +22,9 @@ SONAME    = libsquish.so.$(SOMAJOR)
 
 MINGW    ?= x86_64-w64-mingw32-gcc
 MINGW_AR ?= x86_64-w64-mingw32-ar
+
+CL       ?= cl.exe
+CLFLAGS  ?= /nologo /O2 /W3
 
 all: libsquish.so squish
 
@@ -59,6 +64,15 @@ libsquish-win.a: squish-win.o
 squish.exe: squish_cli.c libsquish-win.a
 	$(MINGW) $(CFLAGS) $(WARN) -o $@ squish_cli.c libsquish-win.a -lm
 
+# ---- Windows DLL + CLI via MSVC (native build; run under a Developer Command
+#      Prompt or after vcvarsall.bat so cl.exe is on PATH) ----------------------
+# Not a squish.dll/squish.exe file rule: it would collide with the mingw
+# rules above. Producing the same output filenames from either toolchain is
+# intentional — pick whichever is available on the host.
+windows-dll:
+	$(CL) $(CLFLAGS) /LD /DSQUISH_BUILD_DLL /Fe:squish.dll squish.c
+	$(CL) $(CLFLAGS) /DSQUISH_DLL /Fe:squish.exe squish_cli.c squish.lib
+
 # ---- tests / examples ---------------------------------------------------------
 test: tests/test_squish
 	./tests/test_squish
@@ -87,6 +101,7 @@ install: libsquish.so libsquish.a squish
 clean:
 	rm -f libsquish.so libsquish.so.* libsquish.a squish.o squish \
 	      squish.dll libsquish.dll.a squish-win.o libsquish-win.a squish.exe \
+	      squish.obj squish_cli.obj squish.lib squish.exp \
 	      tests/test_squish examples/example
 
-.PHONY: all dll test example install clean
+.PHONY: all dll windows-dll test example install clean

@@ -35,10 +35,10 @@ make            # libsquish.so + squish CLI
 make test       # build and run the test suite
 make install    # headers, libs, CLI, pkg-config file to /usr/local
 make dll        # squish.dll + squish.exe via mingw-w64 cross compiler, if installed
+make windows-dll   # squish.dll + squish.exe via MSVC (cl.exe on PATH), native Windows build
 ```
 
-No dependencies beyond libc/libm. For a Windows DLL without mingw, compile
-`squish.c` with MSVC and `/DSQUISH_BUILD_DLL`.
+No dependencies beyond libc/libm.
 
 ## CLI
 
