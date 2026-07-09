@@ -30,6 +30,12 @@ jobs:
         run: |
           LD_LIBRARY_PATH=. ./examples/example
 
+      - name: Self-extracting archive round-trip
+        run: |
+          ./squish s README.md readme.run
+          ( mkdir sfxout && cd sfxout && ../readme.run -q )
+          cmp README.md sfxout/README.md
+
   windows-cross:
     name: cross-compile Windows DLL + CLI
     runs-on: ubuntu-latest
@@ -61,3 +67,13 @@ jobs:
           squish.exe c README.md readme.sq
           squish.exe d readme.sq readme.out
           fc /b README.md readme.out
+
+      - name: Self-extracting archive round-trip
+        shell: cmd
+        run: |
+          squish.exe s README.md readme_sfx.exe
+          mkdir sfxout
+          cd sfxout
+          ..\readme_sfx.exe -q
+          cd ..
+          fc /b README.md sfxout\README.md

@@ -201,3 +201,45 @@ magic. (The magic `SQ01` previously named a pre-release single-stream
 format without the mode byte and checksum; that format was never released
 and no reader accepted it, so the magic has been reassigned to the
 multi-block container, which is distinguishable by its mode byte 2.)
+
+## 11. Self-extracting archive (CLI packaging)
+
+This section is **not** part of the compressed format; it describes how the
+`squish s` command wraps a stream in a runnable executable. The embedded
+stream is an ordinary §1 stream, so this wrapper needs no stream-magic change
+and any squish decoder reads the payload once it is located.
+
+The archive is the platform's `squish` CLI binary (the *stub*) with three
+things appended:
+
+```
+offset            size      field
+0                 S         stub: the squish CLI executable, verbatim
+S                 P         payload: one SQ02/SQ01 stream (§1)
+S + P             N         name: original basename, UTF-8, no terminator
+filesize - 32     32        trailer (below)
+```
+
+The trailer is fixed at 32 bytes; all integers are little-endian:
+
+```
+offset            size      field
+0                 8         magic: 'S' 'Q' 'S' 'F' 'X' '0' '1' 0x0A
+8                 8         payload offset S (= stub size), u64
+16                8         payload length P, u64
+24                4         name length N, u32 (≤ 4096)
+28                4         flags, u32 (0)
+```
+
+- Consistency, which a reader must verify: `S + P + N + 32 == filesize`, with
+  `S ≠ 0`, `P ≠ 0`, and `N ≤ 4096`.
+- The CLI recognizes an archive by reading its own trailing 32 bytes at
+  start-up and checking the magic and that identity; failing either, it runs
+  as the ordinary tool. The stub is statically linked, so the archive runs
+  with no libsquish present.
+- On extraction the stored name is reduced to its last path component (no
+  directory, drive, or `..`), so an archive cannot write outside the chosen
+  directory.
+- The trailer is independent of the stream format: changing it does not affect
+  stream compatibility, and it carries its own version byte (the `1` in the
+  magic) for future revisions.

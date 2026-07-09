@@ -51,6 +51,8 @@ No dependencies beyond libc/libm.
 ./squish -t 0 c bigfile bigfile.sq     # compress on all cores (multi-block)
 ./squish -t 0 -b 4 c big big.sq        # ... with 4 MiB blocks (more parallel,
                                        #     slightly worse ratio)
+./squish s report.pdf report.run       # make a self-extracting archive
+./report.run                           # ... run it to restore report.pdf
 ```
 
 `-t N` compresses with N threads (`0` = all cores) by splitting the input
@@ -61,6 +63,25 @@ ratio-optimal single-block format used for the results table above.
 Decompression always uses all cores when the stream allows it (`-t` caps
 it) and reads both formats transparently. Budget ~150 MB of model memory
 per thread.
+
+The `s` command writes a **self-extracting archive**: `squish s input output`
+compresses `input` and produces an executable `output` that carries the
+compressed data. Running it — with no `squish` and no `libsquish` installed —
+decompresses (and checksum-verifies) the original back to its stored name in
+the current directory, or to a path you name:
+
+```sh
+./squish s report.pdf report.run   # build (Linux: chmod +x is applied for you)
+./report.run                       # restore report.pdf here
+./report.run -f other.pdf          # ... or to a chosen path (-f to overwrite)
+```
+
+The archive is this CLI used as a stub with the payload appended, so it is
+platform-specific: build it on Linux for a Linux archive, on Windows for a
+Windows one (name the output `*.exe`). It takes the same `-t`/`-b`/`-q`
+options as `c`, and running an archive takes `-f`, `-q`, and `-t`. Because it
+embeds the stub, the archive is larger than a plain `.sq` by the size of the
+`squish` binary — worth it for handoff, not for routine storage.
 
 When stderr is a terminal, a live status line (percent, bytes, throughput)
 is shown while working, followed by a one-line summary. Pass `-q` /

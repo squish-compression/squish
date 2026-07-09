@@ -11,6 +11,15 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Added
 
+- CLI: `s` command — build a self-extracting archive. `squish s input output`
+  compresses `input` and appends it (plus the original name and a 32-byte
+  trailer) to a copy of the `squish` CLI used as a stub; the resulting
+  executable restores the file when run, with no `squish` or `libsquish`
+  installed, and checksum-verifies it. Running an archive takes `-f`
+  (overwrite), `-q`, `-t`, and an optional output path; build takes the same
+  `-t`/`-b`/`-q` as `c`. Extraction sanitizes the stored name to a basename,
+  so an archive never writes outside the target directory. The archive is
+  platform-specific (the stub is the host's CLI); see docs/FORMAT.md §11.
 - Multi-threaded compression and decompression: new `SQ01` multi-block
   container (independent `SQ02` chunk streams; see docs/FORMAT.md §1b) and
   library functions `squish_compress_mt` / `squish_decompress_mt`, their
@@ -47,6 +56,11 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 - CLI: the status line and summary now measure throughput on a wall clock
   (was CPU time, which over-counts when threads are in play)
+- Build: the MSVC `squish.exe` (`make windows-dll`, `build-windows.bat`) now
+  links libsquish statically instead of against `squish.dll`, matching the
+  mingw `make dll` build. This makes `squish.exe` stand alone, which the new
+  `s` command requires (an archive copies the CLI as its stub). `squish.dll`
+  is still built for library consumers.
 - Building now requires a threads library: `-pthread` outside Windows
   (added to the Makefile and pkg-config file), Win32 threads on Windows
 

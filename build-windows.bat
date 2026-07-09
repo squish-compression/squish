@@ -33,9 +33,12 @@ if errorlevel 1 (
 )
 
 :build
+rem squish.exe links the library statically (squish.c compiled straight in) so
+rem it stands alone: 'squish s' self-extracting archives copy the CLI as their
+rem stub and must run without squish.dll present.
 cl /nologo /O2 /W3 /LD /DSQUISH_BUILD_DLL /Fe:squish.dll squish.c
 if errorlevel 1 exit /b 1
-cl /nologo /O2 /W3 /DSQUISH_DLL /Fe:squish.exe squish_cli.c squish.lib
+cl /nologo /O2 /W3 /Fe:squish.exe squish_cli.c squish.c
 if errorlevel 1 exit /b 1
 
 echo.
