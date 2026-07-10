@@ -11,17 +11,27 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Added
 
-- CLI: directory support for `c`, `d`, and `s`. When `input` is a directory,
-  `squish c` serializes the whole tree (files, subdirectories, empty
-  directories, and unix permission bits) into a single `SQAR` archive stream
-  and compresses that; `squish d` detects the archive on decompression and
-  recreates the tree under `output`. `squish s` packs a directory the same
-  way into a self-extracting executable. Single-file compression is
-  unchanged and byte-for-byte compatible with earlier releases (the archive
-  wrapper is used only for directories). Extraction rejects absolute paths
-  and `..` traversal, so an archive can never write outside its target
-  directory; entries are stored in sorted order, so an archive depends only
-  on the tree, not on filesystem iteration order. See docs/FORMAT.md §12.
+- Seekable directory archives (`SQAR02`) and a library archive API. A
+  directory is now packed so that each file is compressed as its **own**
+  stream, behind a header and a compressed index of paths and offsets — so a
+  reader can view the header, list members, and inflate a single file or
+  subtree by seeking straight to it, without decompressing the rest of the
+  archive. New in `squish.h`: `squish_archive_create`, `squish_archive_open` /
+  `_open_memory` / `_close`, `_probe`, `_info_get`, `_count`, `_stat`, `_find`,
+  `_extract` / `_extract_path` / `_extract_to_file`, and `_extract_subtree`,
+  plus the `squish_archive`, `squish_archive_info`, and `squish_archive_entry`
+  types. All archive logic now lives in libsquish (previously CLI-only), so
+  DLL/SO consumers get it too. Directories, empty directories, and unix
+  permission bits are preserved; members are stored sorted (reproducible), and
+  extraction rejects absolute paths and `..` traversal. Single-file
+  compression is unchanged and byte-for-byte compatible with earlier releases.
+  See docs/FORMAT.md §12 and docs/API.md.
+- CLI: directory operations for `c`, `d`, `l`, `x`, and `s`. `squish c <dir>`
+  builds a seekable `SQAR` archive; `squish l <archive>` lists it; `squish x
+  <archive> <member> [dest]` extracts one file or subtree without touching the
+  rest; `squish d` extracts the whole tree (auto-detecting an archive vs. a
+  plain stream); `squish s` packs a directory into a self-extracting executable
+  (the stub sniffs the payload to tell an archive from a single-file stream).
 - CLI: `s` command — build a self-extracting archive. `squish s input output`
   compresses `input` and appends it (plus the original name and a 32-byte
   trailer) to a copy of the `squish` CLI used as a stub; the resulting

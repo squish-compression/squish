@@ -79,18 +79,27 @@ container wraps independent `SQ02` chunk streams that compress and
 decompress in parallel (`squish -t`, `squish_*_mt`), trading ~1–2% of
 ratio for near-linear speedup.
 
+Directories use a third container, `"SQAR02"`: a header, one `SQ02`/`SQ01`
+stream per file, and a compressed index of paths and offsets, so a single
+file or subtree can be extracted by seeking to just its stream instead of
+inflating the whole archive.
+
 ## Usage
 
 ```
 make                            # libsquish.so + squish CLI
 ./squish c input output.sq      # compress a file (or a directory tree)
 ./squish d output.sq restored   # decompress (checksum-verified)
+./squish l archive.sqar         # list an archive's contents
+./squish x archive.sqar a/b.txt # extract one file (or subtree) from an archive
 ```
 
-`input` may be a directory: it is serialized into a single `SQAR` archive
-stream and compressed as one unit, and `d` recreates the tree under
-`restored`. Single files are compressed exactly as before. See
-[docs/FORMAT.md](docs/FORMAT.md) §12.
+`input` may be a directory: it is packed into a **seekable `SQAR` archive**,
+each file its own stream, so `l` lists the contents and `x` pulls out a single
+file or subtree without inflating the rest; `d` recreates the whole tree under
+`restored`. Single files are compressed exactly as before. The same operations
+are available to library consumers through the `squish_archive_*` API. See
+[docs/FORMAT.md](docs/FORMAT.md) §12 and [docs/API.md](docs/API.md).
 
 SQUISH is also a library — `squish.h` + `libsquish.so` (or `make dll` for
 Windows); see [docs/API.md](docs/API.md) and `examples/`.

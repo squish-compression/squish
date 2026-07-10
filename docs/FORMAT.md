@@ -205,9 +205,12 @@ multi-block container, which is distinguishable by its mode byte 2.)
 ## 11. Self-extracting archive (CLI packaging)
 
 This section is **not** part of the compressed format; it describes how the
-`squish s` command wraps a stream in a runnable executable. The embedded
-stream is an ordinary §1 stream, so this wrapper needs no stream-magic change
-and any squish decoder reads the payload once it is located.
+`squish s` command wraps a payload in a runnable executable. For a single file
+the payload is an ordinary §1 stream; for a directory it is a whole `SQAR02`
+archive container (§12), embedded verbatim. The stub tells them apart by
+sniffing the payload's first bytes: the `SQAR02` magic means "unpack a tree",
+anything else means "decode one §1 stream". Either way the wrapper needs no
+stream-magic change.
 
 The archive is the platform's `squish` CLI binary (the *stub*) with three
 things appended:
@@ -215,7 +218,7 @@ things appended:
 ```
 offset            size      field
 0                 S         stub: the squish CLI executable, verbatim
-S                 P         payload: one SQ02/SQ01 stream (§1)
+S                 P         payload: a §1 stream (file) or SQAR02 archive (dir)
 S + P             N         name: original basename, UTF-8, no terminator
 filesize - 32     32        trailer (below)
 ```
@@ -244,54 +247,64 @@ offset            size      field
   stream compatibility, and it carries its own version byte (the `1` in the
   magic) for future revisions.
 
-## 12. Directory archive "SQAR" (CLI packaging)
+## 12. Seekable directory archive "SQAR02"
 
-Like §11, this section is **not** part of the compressed format. It describes
-how the CLI packs a directory tree into a single byte stream so the ordinary
-compressor can handle directories without knowing anything about files. The
-CLI serializes the tree into an `SQAR` buffer, compresses that buffer as an
-§1 stream, and on decompression checks whether the decompressed bytes begin
-with the `SQAR` magic: if so it unpacks a tree, otherwise the bytes are a
-single file, written verbatim. Single-file compression never uses this
-wrapper, so it stays byte-for-byte compatible with readers that predate it.
+Unlike §§1–10, this container is **not** a coded stream — it is a wrapper that
+holds many of them. It lets a directory tree be packed so that a reader can
+view the header, list members, and inflate one file (or one subtree) by
+**seeking straight to that member's stream**, never touching the rest. The
+tradeoff versus compressing the whole tree as one solid §1 stream: each file's
+model starts cold, so many tiny files compress a little worse.
 
-The buffer is a fixed header followed by a flat, pre-order list of entries;
-all integers are little-endian:
+An archive is a fixed 56-byte header, then the member streams back to back,
+then a compressed index. All integers are little-endian:
 
 ```
-offset  size       field
-0       8          magic: 'S' 'Q' 'A' 'R' '0' '1' 0x0A 0x1A
-8       4          version u32 (currently 1)
-12      4          flags u32 (0)
-16      8          entry count u64
-24      ...        entries
+offset  size  field
+0       8     magic: 'S' 'Q' 'A' 'R' '0' '2' 0x0A 0x1A
+8       4     version u32 (currently 2)
+12      4     flags u32 (0)
+16      8     entry_count u64
+24      8     total_size u64        (sum of member uncompressed sizes)
+32      8     index_offset u64      (absolute offset of the index blob)
+40      8     index_comp_size u64   (index blob length, bytes)
+48      8     index_orig_size u64   (index length after decompression)
+56      ...   member data region: each regular file's contents as a complete
+              §1 stream (SQ02, or SQ01 for files past one chunk), concatenated
+...     ...   index blob at index_offset: a §1 stream whose decoded bytes are
+              the entry table below
 ```
 
-Each entry:
+The index blob decodes to `entry_count` entries, in pre-order (directories
+before their contents, siblings sorted by name — so the archive depends only on
+the tree, not on directory iteration order). Each entry:
 
 ```
-offset  size       field
-0       1          type: 0 = regular file, 1 = directory
-1       4          mode u32: unix permission bits (low 9); informational,
-                   synthesized as 0644/0755 by producers without them
-5       4          path length P u32 (1 .. 65535)
-9       8          data length D u64 (0 for a directory)
-17      P          path: relative, '/'-separated, UTF-8, no terminator
-17 + P  D          file contents (regular files only; absent for a directory)
+offset  size  field
+0       1     type: 0 = regular file, 1 = directory
+1       4     mode u32: unix permission bits (low 9); informational,
+              synthesized as 0644/0755 by producers without them
+5       8     orig_size u64      (uncompressed size; 0 for a directory)
+13      8     comp_offset u64    (offset of this file's stream; 0 for a dir)
+21      8     comp_size u64      (stream length in bytes; 0 for a directory)
+29      4     path_len P u32 (1 .. 65535)
+33      P     path: relative, '/'-separated, UTF-8, no terminator
 ```
 
-- Paths are relative to the archived directory and use `/` separators.
-  Directories are emitted before their contents so empty directories are
-  preserved. Sibling entries are stored sorted by name, so the archive
-  depends only on the tree, not on directory iteration order.
-- A reader must reject any entry whose path is absolute, contains an empty,
-  `.`, or `..` component, or contains `\` or `:` — this is what stops an
-  archive from writing outside the extraction root. It must also verify that
-  every length field stays within the buffer and that the entries tile it
-  exactly; a violation is a format error.
-- There is no archive-level checksum: the enclosing §1 stream already
-  carries and verifies one over these exact bytes.
-- Because the archive is just the payload of an ordinary stream, `squish s`
-  (§11) packs a directory with no change to the SFX wrapper — the stub
-  decompresses the payload and, finding the `SQAR` magic, unpacks a tree
-  instead of writing one file.
+- To read one member: decode the index blob once, look the path up, then decode
+  the single §1 stream at `[comp_offset, comp_offset + comp_size)`. That stream
+  carries and verifies its own checksum (§1), so there is no archive-level
+  checksum.
+- A reader must reject (as a format error): a wrong magic or version; an index
+  blob that does not lie wholly after the header and inside the file; entries
+  that do not tile `index_orig_size` exactly; for a file, a `[comp_offset,
+  comp_size)` range not contained in the member region `[56, index_offset)`;
+  for a directory, any nonzero `orig_size`/`comp_offset`/`comp_size`; and — as
+  in §11 — any path that is absolute or contains an empty, `.`, or `..`
+  component or a `\` or `:` character. The path rule is what stops a member
+  from being written outside the extraction root.
+- The header exposes `total_size` and `entry_count` for a cheap listing without
+  inflating any member; `index_orig_size` bounds the index allocation.
+- `SQAR01`, the pre-2 format, serialized the whole tree into one buffer and
+  compressed it as a single §1 stream — no random access. It was never released
+  and is not readable by version-2 tools; the magic distinguishes them.

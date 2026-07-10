@@ -21,6 +21,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* portable directory ops for the archive tests */
+#if defined(_WIN32)
+#  include <direct.h>
+#  define MKDIR(p) _mkdir(p)
+#  define RMDIR(p) _rmdir(p)
+#else
+#  include <sys/stat.h>
+#  include <unistd.h>
+#  define MKDIR(p) mkdir((p), 0777)
+#  define RMDIR(p) rmdir(p)
+#endif
+
 static int failures = 0;
 #define CHECK(cond, name) do { \
     if (cond) printf("ok   %s\n", name); \
@@ -49,6 +61,24 @@ static void progress_probe(uint64_t processed, uint64_t total, void *user) {
 
 static void wr_le(uint8_t *p, uint64_t v, int nb) {
     for (int i = 0; i < nb; i++) p[i] = (uint8_t)(v >> (8*i));
+}
+
+/* write n bytes to path (archive test fixtures) */
+static void wfile(const char *path, const void *d, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (f) { if (n) fwrite(d, 1, n, f); fclose(f); }
+}
+/* 1 if file `path` holds exactly d[0..n) */
+static int file_is(const char *path, const void *d, size_t n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+    size_t got = buf ? fread(buf, 1, n, f) : 0;
+    int extra = fgetc(f);                 /* must be EOF: no trailing bytes */
+    fclose(f);
+    int ok = buf && got == n && extra == EOF && (n == 0 || memcmp(buf, d, n) == 0);
+    free(buf);
+    return ok;
 }
 
 static void roundtrip(const uint8_t *data, size_t n, const char *name) {
@@ -367,6 +397,134 @@ int main(void) {
         fclose(a); fclose(b);
         CHECK(same, "  mt file round-trip identical");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
+    }
+
+    {   /* seekable archive: create, header, list, single-member + subtree
+         * extract, memory-backed open, and malformed-input rejection */
+        const char *root = "tests/.t_arc";
+        const char *arc  = "tests/.t_arc.sqar";
+
+        /* fixture tree:
+         *   .t_arc/a.txt              (compressible text)
+         *   .t_arc/empty/             (empty directory, must survive)
+         *   .t_arc/sub/b.bin          (pseudo-random)
+         *   .t_arc/sub/deep/c.txt     (repetitive) */
+        static uint8_t atxt[64], bbin[5000], ctxt[3000];
+        for (size_t i = 0; i < sizeof atxt; i++) atxt[i] = (uint8_t)('a' + (i % 26));
+        for (size_t i = 0; i < sizeof bbin; i++) bbin[i] = rnd();
+        for (size_t i = 0; i < sizeof ctxt; i++) ctxt[i] = "SQUISH\n"[i % 7];
+        MKDIR(root);
+        MKDIR("tests/.t_arc/empty");
+        MKDIR("tests/.t_arc/sub");
+        MKDIR("tests/.t_arc/sub/deep");
+        wfile("tests/.t_arc/a.txt", atxt, sizeof atxt);
+        wfile("tests/.t_arc/sub/b.bin", bbin, sizeof bbin);
+        wfile("tests/.t_arc/sub/deep/c.txt", ctxt, sizeof ctxt);
+
+        int rc = squish_archive_create(root, arc, 1, 0, NULL, NULL);
+        CHECK(rc == SQUISH_OK, "archive_create");
+
+        squish_archive *A = NULL;
+        CHECK(squish_archive_open(arc, &A) == SQUISH_OK && A, "archive_open");
+        if (A) {
+            squish_archive_info info;
+            CHECK(squish_archive_info_get(A, &info) == SQUISH_OK &&
+                  info.version == 2 && info.entry_count == 6 &&
+                  info.total_size == sizeof atxt + sizeof bbin + sizeof ctxt,
+                  "  header + entry count");
+            CHECK(squish_archive_count(A) == 6, "  count");
+
+            /* entries are pre-order, dirs before contents, siblings sorted:
+             * a.txt, empty/, sub/, sub/b.bin, sub/deep/, sub/deep/c.txt */
+            squish_archive_entry e;
+            CHECK(squish_archive_stat(A, 0, &e) == SQUISH_OK &&
+                  strcmp(e.path, "a.txt") == 0 && !e.is_dir &&
+                  e.size == sizeof atxt, "  stat[0] = a.txt");
+            CHECK(squish_archive_stat(A, 1, &e) == SQUISH_OK &&
+                  strcmp(e.path, "empty") == 0 && e.is_dir && e.size == 0,
+                  "  stat[1] = empty/ (dir)");
+
+            uint64_t idx = 999;
+            CHECK(squish_archive_find(A, "sub/b.bin", &idx) == SQUISH_OK,
+                  "  find sub/b.bin");
+            CHECK(squish_archive_find(A, "nope", NULL) == SQUISH_E_FORMAT,
+                  "  find missing -> E_FORMAT");
+
+            /* single-member extract reads only that member's stream */
+            void *m = NULL; size_t mn = 0;
+            CHECK(squish_archive_extract(A, idx, &m, &mn) == SQUISH_OK &&
+                  mn == sizeof bbin && m && memcmp(m, bbin, mn) == 0,
+                  "  extract b.bin bytes match");
+            squish_free(m);
+            CHECK(squish_archive_extract_path(A, "sub/deep/c.txt", &m, &mn)
+                  == SQUISH_OK && mn == sizeof ctxt && memcmp(m, ctxt, mn) == 0,
+                  "  extract_path c.txt bytes match");
+            squish_free(m);
+
+            /* a directory member cannot be extracted as data */
+            uint64_t di = 1;
+            CHECK(squish_archive_extract(A, di, &m, &mn) == SQUISH_E_PARAM &&
+                  m == NULL, "  extract dir -> E_PARAM");
+
+            /* extract one file to disk */
+            CHECK(squish_archive_extract_to_file(A, "a.txt", "tests/.t_a") == SQUISH_OK &&
+                  file_is("tests/.t_a", atxt, sizeof atxt), "  extract_to_file a.txt");
+            remove("tests/.t_a");
+
+            /* subtree extract recreates only sub/ under the destination root */
+            CHECK(squish_archive_extract_subtree(A, "sub", "tests/.t_out", NULL, NULL)
+                  == SQUISH_OK, "  extract_subtree sub");
+            CHECK(file_is("tests/.t_out/sub/b.bin", bbin, sizeof bbin) &&
+                  file_is("tests/.t_out/sub/deep/c.txt", ctxt, sizeof ctxt),
+                  "  subtree files present");
+            /* files outside the prefix were NOT written */
+            CHECK(!file_is("tests/.t_out/a.txt", atxt, sizeof atxt),
+                  "  subtree excluded a.txt");
+            remove("tests/.t_out/sub/deep/c.txt");
+            remove("tests/.t_out/sub/b.bin");
+            RMDIR("tests/.t_out/sub/deep");
+            RMDIR("tests/.t_out/sub");
+            RMDIR("tests/.t_out");
+
+            squish_archive_close(A);
+        }
+
+        /* memory-backed open over the same archive image */
+        {
+            FILE *f = fopen(arc, "rb");
+            long sz = 0; uint8_t *img = NULL;
+            if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); rewind(f);
+                     img = (uint8_t *)malloc(sz > 0 ? (size_t)sz : 1);
+                     if (img) { if (fread(img, 1, (size_t)sz, f) != (size_t)sz) sz = 0; }
+                     fclose(f); }
+            squish_archive *M = NULL;
+            CHECK(img && squish_archive_open_memory(img, (size_t)sz, &M) == SQUISH_OK && M,
+                  "archive_open_memory");
+            void *m = NULL; size_t mn = 0;
+            CHECK(M && squish_archive_extract_path(M, "sub/b.bin", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof bbin && memcmp(m, bbin, mn) == 0,
+                  "  memory extract matches");
+            squish_free(m);
+            /* probe agrees with the container; a plain stream is not an archive */
+            CHECK(img && squish_archive_probe(img, (size_t)sz) == 1, "  probe archive");
+            CHECK(squish_archive_probe("SQ02not-an-archive", 18) == 0, "  probe non-archive");
+            squish_archive_close(M);
+            /* a truncated image is rejected, not crashed */
+            squish_archive *T = NULL;
+            CHECK(!img || squish_archive_open_memory(img, 20, &T) == SQUISH_E_FORMAT,
+                  "  truncated image rejected");
+            free(img);
+        }
+
+        /* cleanup fixture tree (files then dirs, bottom-up) */
+        remove(arc);
+        remove("tests/.t_arc/a.txt");
+        remove("tests/.t_arc/sub/b.bin");
+        remove("tests/.t_arc/sub/deep/c.txt");
+        RMDIR("tests/.t_arc/sub/deep");
+        RMDIR("tests/.t_arc/sub");
+        RMDIR("tests/.t_arc/empty");
+        RMDIR("tests/.t_arc");
     }
 
     printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);

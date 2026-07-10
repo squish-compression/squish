@@ -14,15 +14,58 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* Minimal libsquish usage: compress and restore a buffer.
+/* Minimal libsquish usage: compress and restore a buffer, and — given an
+ * archive path — list it and pull out one member without inflating the rest.
  * Build (from repo root):  make example   — links against libsquish.so
+ * Run:  ./examples/example [archive.sqar]
  */
 #include <squish.h>   /* or "squish.h" when building in-tree */
 
 #include <stdio.h>
 #include <string.h>
 
-int main(void) {
+/* List a seekable archive and extract its first file member. */
+static int archive_demo(const char *path) {
+    squish_archive *a;
+    int rc = squish_archive_open(path, &a);
+    if (rc != SQUISH_OK) {
+        fprintf(stderr, "open %s: %s\n", path, squish_strerror(rc));
+        return 1;
+    }
+    squish_archive_info info;
+    squish_archive_info_get(a, &info);
+    printf("archive %s: v%u, %llu entries, %llu bytes uncompressed\n",
+           path, info.version, (unsigned long long)info.entry_count,
+           (unsigned long long)info.total_size);
+
+    uint64_t first_file = info.entry_count;   /* sentinel: none found */
+    for (uint64_t i = 0; i < info.entry_count; i++) {
+        squish_archive_entry e;
+        squish_archive_stat(a, i, &e);
+        printf("  %04o %10llu  %s%s\n", e.mode & 0777u,
+               (unsigned long long)e.size, e.path, e.is_dir ? "/" : "");
+        if (!e.is_dir && first_file == info.entry_count) first_file = i;
+    }
+
+    if (first_file < info.entry_count) {
+        void *buf; size_t len;
+        rc = squish_archive_extract(a, first_file, &buf, &len);   /* only this member */
+        if (rc == SQUISH_OK) {
+            squish_archive_entry e;
+            squish_archive_stat(a, first_file, &e);
+            printf("extracted %s: %zu bytes\n", e.path, len);
+            squish_free(buf);
+        } else {
+            fprintf(stderr, "extract: %s\n", squish_strerror(rc));
+        }
+    }
+    squish_archive_close(a);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) return archive_demo(argv[1]);
+
     const char *text =
         "Context mixing turns compression into prediction: many models "
         "vote on every bit, a mixer learns whom to trust, and an "

@@ -48,8 +48,10 @@ No dependencies beyond libc/libm.
 ```sh
 ./squish c bigfile bigfile.sq          # compress
 ./squish d bigfile.sq restored         # decompress (checksum-verified)
-./squish c project project.sq          # compress a whole directory tree
-./squish d project.sq restored-dir     # ... recreate it under restored-dir
+./squish c project project.sqar        # pack a whole directory tree
+./squish l project.sqar                # list the archive's contents
+./squish x project.sqar src/main.c     # extract one file (or a subtree)
+./squish d project.sqar restored-dir   # recreate the whole tree under restored-dir
 ./squish -t 0 c bigfile bigfile.sq     # compress on all cores (multi-block)
 ./squish -t 0 -b 4 c big big.sq        # ... with 4 MiB blocks (more parallel,
                                        #     slightly worse ratio)
@@ -57,15 +59,18 @@ No dependencies beyond libc/libm.
 ./report.run                           # ... run it to restore report.pdf
 ```
 
-`input` may be a file or a **directory**. A directory is packed into a single
-archive stream (files, subdirectories, empty directories, and permission bits
-preserved) and compressed as one unit, so cross-file redundancy is modeled
-too; `d` detects the archive and recreates the tree under `output`.
-Extraction refuses absolute paths and `..`, so an archive never writes
-outside its target directory, and entries are stored sorted, so the output
-depends only on the tree. Single files are compressed exactly as before —
-the archive wrapper is used only for directories. See
-[docs/FORMAT.md §12](docs/FORMAT.md) for the layout.
+`input` may be a file or a **directory**. A directory is packed into a
+**seekable `SQAR` archive** — every file compressed as its own stream, with
+directories, empty directories, and permission bits preserved. That lets `l`
+list the contents and `x` pull out a single file or subtree by seeking to just
+its stream, without inflating the rest; `d` recreates the whole tree under
+`output`. Extraction refuses absolute paths and `..`, so an archive never
+writes outside its target directory, and members are stored sorted, so the
+output depends only on the tree. The tradeoff for random access: each file's
+model starts cold, so many tiny files compress a little worse than one solid
+stream. Single files are compressed exactly as before. Library consumers get
+the same operations through the `squish_archive_*` API; see
+[docs/API.md](docs/API.md) and [docs/FORMAT.md §12](docs/FORMAT.md).
 
 `-t N` compresses with N threads (`0` = all cores) by splitting the input
 into independently modeled blocks — near-linear speedup, at a small ratio

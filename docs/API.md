@@ -183,6 +183,105 @@ stream — see [FORMAT.md](FORMAT.md) §1b. Points worth knowing:
 
 ---
 
+## Archives
+
+A directory tree can be packed into a **seekable SQAR archive**: a header, one
+independently-compressed stream per file, and a compressed index of paths and
+per-file offsets. A reader inflates the small index at open time, then reaches
+any single member by seeking to its stream — the rest of the archive is never
+touched. The price of that random access is that each file's model starts cold,
+so many tiny files compress a little worse than one solid stream would. The
+container is specified byte-for-byte in [FORMAT.md](FORMAT.md) §12; it is **not**
+a `squish_decompress` stream, so use the `squish_archive_*` functions below.
+
+```c
+int squish_archive_create(const char *dir_path, const char *archive_path,
+                          int nthreads, size_t chunk_size,
+                          squish_progress_fn cb, void *user);
+```
+Walks `dir_path` and writes a seekable archive to `archive_path`, compressing
+each file as its own stream. `nthreads`/`chunk_size` behave as in the `_mt`
+functions (a file larger than one chunk becomes a parallel `SQ01` stream);
+`cb` reports total uncompressed bytes packed. Directories (including empty
+ones) and unix mode bits are recorded; sockets, fifos, and dangling links are
+skipped. Members are stored pre-order, siblings sorted, so the archive depends
+only on the tree — not on directory iteration order.
+
+```c
+int  squish_archive_probe(const void *data, size_t len);   /* needs 12 bytes */
+int  squish_archive_open(const char *path, squish_archive **out);
+int  squish_archive_open_memory(const void *data, size_t len, squish_archive **out);
+void squish_archive_close(squish_archive *a);
+```
+`open` reads and validates **only the header and the index** — work
+proportional to the member count, not the archive size — keeping the file open
+to seek per extraction. `open_memory` borrows a buffer that must outlive the
+handle (it must not be freed until `close`). `probe` is a cheap sniff for
+telling an archive from a plain stream. A handle is not thread-safe; use one
+per thread, or serialize calls.
+
+```c
+int      squish_archive_info_get(const squish_archive *a, squish_archive_info *out);
+uint64_t squish_archive_count(const squish_archive *a);
+int      squish_archive_stat(const squish_archive *a, uint64_t index,
+                             squish_archive_entry *out);
+int      squish_archive_find(const squish_archive *a, const char *path,
+                             uint64_t *index_out);
+```
+Header and listing, all served from the in-memory index with no decompression.
+`info` exposes `version`, `flags`, `entry_count`, and `total_size` (the summed
+uncompressed size). `stat` fills a `squish_archive_entry` (`path`,
+`size`, `stored_size`, `mode`, `is_dir`); its `path` points into the handle and
+is valid until `close`. `find` returns `SQUISH_E_FORMAT` when the path is not a
+member (a trailing `/` on the query is ignored).
+
+```c
+int squish_archive_extract(squish_archive *a, uint64_t index,
+                           void **out, size_t *out_len);
+int squish_archive_extract_path(squish_archive *a, const char *path,
+                                void **out, size_t *out_len);
+```
+Inflate **one** member into a library-allocated buffer (free with
+`squish_free`), reading and decoding only that member's stream and verifying
+its checksum. A directory member returns `SQUISH_E_PARAM`.
+
+```c
+int squish_archive_extract_to_file(squish_archive *a, const char *path,
+                                   const char *dst_path);
+int squish_archive_extract_subtree(squish_archive *a, const char *prefix,
+                                   const char *dst_root,
+                                   squish_progress_fn cb, void *user);
+```
+Extract to the filesystem, inflating only what is needed. `_to_file` writes a
+single file member to `dst_path` (its parent directories must already exist).
+`_extract_subtree` recreates, under `dst_root`, every member whose path is
+`prefix` or lies beneath it — each landing at `dst_root/<archive path>`;
+`prefix` NULL or `""` extracts the whole archive. Member paths are re-validated
+against traversal on the way out, so an archive can never write outside
+`dst_root`.
+
+```c
+/* list every member, then pull one file out — reading only its stream */
+squish_archive *a;
+if (squish_archive_open("photos.sqar", &a) == SQUISH_OK) {
+    uint64_t n = squish_archive_count(a);
+    for (uint64_t i = 0; i < n; i++) {
+        squish_archive_entry e;
+        squish_archive_stat(a, i, &e);
+        printf("%s%s (%llu bytes)\n", e.path, e.is_dir ? "/" : "",
+               (unsigned long long)e.size);
+    }
+    void *buf; size_t len;
+    if (squish_archive_extract_path(a, "2026/trip/cover.jpg", &buf, &len) == SQUISH_OK) {
+        /* ... use buf[0..len) ... */
+        squish_free(buf);
+    }
+    squish_archive_close(a);
+}
+```
+
+---
+
 ## Linking recipes
 
 ```sh

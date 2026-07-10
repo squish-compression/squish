@@ -238,6 +238,102 @@ SQUISH_API int squish_decompress_file_mt(const char *src_path,
                                          squish_progress_fn progress,
                                          void *user);
 
+/* --- seekable archives ("SQAR" containers) ------------------------------- *
+ *
+ * A directory tree can be packed into an SQAR archive: a header, one
+ * independently-compressed stream per file, and a compact index (paths +
+ * per-file offsets/sizes) so a reader can view the header, list members, and
+ * inflate a single file or subtree by seeking straight to it — without ever
+ * decompressing the rest of the archive. Contrast with a solid stream, which
+ * must be inflated whole to reach any byte; the price here is that each file's
+ * model starts cold, so many tiny files compress a little worse.
+ *
+ * Full byte-level spec: docs/FORMAT.md §12. The archive is a standalone
+ * container, not a §1 stream — squish_decompress does NOT read it; the
+ * squish_archive_* functions do.
+ */
+
+/* Opaque archive reader. Not thread-safe: serialize calls on one handle, or
+ * open one handle per thread. Different handles are independent. */
+typedef struct squish_archive squish_archive;
+
+/* Archive-wide header, filled by squish_archive_info_get. */
+typedef struct squish_archive_info {
+    uint32_t version;       /* container version (currently 2)               */
+    uint32_t flags;         /* reserved, currently 0                         */
+    uint64_t entry_count;   /* number of members (files + directories)       */
+    uint64_t total_size;    /* sum of member uncompressed sizes              */
+} squish_archive_info;
+
+/* One member, filled by squish_archive_stat. `path` points into the handle
+ * and stays valid until squish_archive_close. */
+typedef struct squish_archive_entry {
+    const char *path;        /* relative, '/'-separated, UTF-8, NUL-terminated */
+    uint64_t    size;        /* uncompressed size (0 for a directory)         */
+    uint64_t    stored_size; /* compressed stream size (0 for a directory)    */
+    uint32_t    mode;        /* unix permission bits (low 9), informational   */
+    int         is_dir;      /* 1 = directory, 0 = regular file               */
+} squish_archive_entry;
+
+/* Nonzero iff the first bytes are a valid archive header (magic + version).
+ * A cheap sniff for telling an archive from a plain stream; needs 12 bytes. */
+SQUISH_API int squish_archive_probe(const void *data, size_t len);
+
+/* Open an archive for reading. Reads and validates only the header and the
+ * (compressed) index — work proportional to the number of members, not the
+ * archive size. On success *out owns resources freed by squish_archive_close;
+ * on any error *out is NULL. Returns SQUISH_OK, SQUISH_E_IO (file trouble),
+ * SQUISH_E_FORMAT (not an archive / corrupt), SQUISH_E_NOMEM, SQUISH_E_PARAM.
+ * squish_archive_open keeps the file open and seeks per extraction;
+ * squish_archive_open_memory borrows `data` (which must outlive the handle). */
+SQUISH_API int  squish_archive_open(const char *path, squish_archive **out);
+SQUISH_API int  squish_archive_open_memory(const void *data, size_t len,
+                                           squish_archive **out);
+SQUISH_API void squish_archive_close(squish_archive *a);
+
+/* Header and listing (all served from the in-memory index; no decompression).
+ * stat's `index` is 0..count-1; find returns SQUISH_E_FORMAT if `path` is not
+ * a member (mirroring "no such stream"). */
+SQUISH_API int      squish_archive_info_get(const squish_archive *a,
+                                            squish_archive_info *out);
+SQUISH_API uint64_t squish_archive_count(const squish_archive *a);
+SQUISH_API int      squish_archive_stat(const squish_archive *a, uint64_t index,
+                                        squish_archive_entry *out);
+SQUISH_API int      squish_archive_find(const squish_archive *a,
+                                        const char *path, uint64_t *index_out);
+
+/* Extract ONE member into a library-allocated buffer (free with squish_free);
+ * reads and inflates only that member's stream and verifies its checksum. A
+ * directory member yields SQUISH_E_PARAM. On any error *out is NULL. The
+ * _path form is squish_archive_find + squish_archive_extract. */
+SQUISH_API int squish_archive_extract(squish_archive *a, uint64_t index,
+                                      void **out, size_t *out_len);
+SQUISH_API int squish_archive_extract_path(squish_archive *a, const char *path,
+                                           void **out, size_t *out_len);
+
+/* Extract to the filesystem, inflating only what is needed. _to_file writes a
+ * single file member to dst_path (parent directories must already exist).
+ * _extract_subtree recreates, under dst_root, every member whose path is
+ * `prefix` or lies beneath it; prefix NULL or "" extracts the whole archive.
+ * `cb` (may be NULL) reports uncompressed bytes written so far. */
+SQUISH_API int squish_archive_extract_to_file(squish_archive *a,
+                                              const char *path,
+                                              const char *dst_path);
+SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
+                                              const char *prefix,
+                                              const char *dst_root,
+                                              squish_progress_fn cb, void *user);
+
+/* Build a seekable archive at archive_path from the directory tree dir_path,
+ * compressing each file as its own stream (nthreads / chunk_size as the _mt
+ * functions; each file that exceeds one chunk becomes a parallel SQ01 stream).
+ * `cb` (may be NULL) reports total uncompressed bytes packed so far. Returns
+ * SQUISH_OK or SQUISH_E_IO / E_NOMEM / E_PARAM / E_TOOBIG. */
+SQUISH_API int squish_archive_create(const char *dir_path,
+                                     const char *archive_path,
+                                     int nthreads, size_t chunk_size,
+                                     squish_progress_fn cb, void *user);
+
 #ifdef __cplusplus
 }
 #endif

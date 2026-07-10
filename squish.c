@@ -1097,3 +1097,697 @@ SQUISH_API int squish_decompress_file_mt(const char *src_path,
     squish_free(out);
     return rc;
 }
+
+/* ============================================================================
+ * Seekable archive container "SQAR" (see docs/FORMAT.md §12)
+ *
+ * A directory becomes a header, one independently-compressed §1 stream per
+ * file, and a compressed index of (path, mode, size, stream offset/size). A
+ * reader inflates the small index at open time, then reaches any single member
+ * by seeking to its stream — the rest of the archive is never touched. All
+ * integers little-endian.
+ *
+ *   0   8  magic "SQAR02\n\x1a"
+ *   8   4  version u32 (2)          16  8  entry_count u64
+ *   12  4  flags   u32 (0)          24  8  total_size  u64 (sum of file sizes)
+ *   32  8  index_offset u64         40  8  index_comp_size u64
+ *   48  8  index_orig_size u64      56  ... member streams, then index blob
+ *
+ * Index entry: type u8 | mode u32 | orig u64 | coff u64 | csize u64 |
+ *              plen u32 | path[plen]     (dirs carry orig/coff/csize = 0)
+ * ==========================================================================*/
+#include <errno.h>
+#if defined(_WIN32)
+#  include <direct.h>
+#  include <io.h>
+#else
+#  include <sys/types.h>
+#  include <sys/stat.h>
+#  include <dirent.h>
+#endif
+
+static const u8 SQAR_MAGIC[8] = { 'S','Q','A','R','0','2','\n','\x1a' };
+#define SQAR_VERSION    2u
+#define SQAR_HDR        56u        /* fixed container header size            */
+#define SQAR_ENT_FIXED  33u        /* type1+mode4+orig8+coff8+csize8+plen4   */
+#define SQAR_MAX_PATH   65535u
+
+#if defined(_WIN32)
+#  define sq_fseek64(f,o) _fseeki64((f),(long long)(o),SEEK_SET)
+#else
+#  define sq_fseek64(f,o) fseeko((f),(off_t)(o),SEEK_SET)
+#endif
+
+/* ---------------- growable byte buffer ----------------------------------- */
+typedef struct { u8 *p; size_t len, cap; } gbuf;
+
+static int gbuf_put(gbuf *b, const void *d, size_t n) {
+    if (!n) return 0;
+    if (b->len + n < b->len) return -1;                     /* size_t wrap */
+    if (b->len + n > b->cap) {
+        size_t nc = b->cap ? b->cap : 4096;
+        while (nc < b->len + n) {
+            if (nc > (size_t)-1 / 2) { nc = b->len + n; break; }
+            nc *= 2;
+        }
+        u8 *np = (u8*)realloc(b->p, nc);
+        if (!np) return -1;
+        b->p = np; b->cap = nc;
+    }
+    memcpy(b->p + b->len, d, n);
+    b->len += n;
+    return 0;
+}
+static int gbuf_u8 (gbuf *b, u8 v)  { return gbuf_put(b, &v, 1); }
+static int gbuf_u32(gbuf *b, u32 v) { u8 t[4]; put_le(t, v, 4); return gbuf_put(b, t, 4); }
+static int gbuf_u64(gbuf *b, u64 v) { u8 t[8]; put_le(t, v, 8); return gbuf_put(b, t, 8); }
+
+/* ---------------- path helpers ------------------------------------------- */
+
+/* malloc "<a>/<b>", or a plain copy of b when a is empty/NULL. NULL on OOM. */
+static char *path_join(const char *a, const char *b) {
+    size_t la = a ? strlen(a) : 0, lb = strlen(b);
+    char *r = (char*)malloc(la + 1 + lb + 1);
+    if (!r) return NULL;
+    if (la) { memcpy(r, a, la); r[la] = '/'; memcpy(r + la + 1, b, lb + 1); }
+    else    { memcpy(r, b, lb + 1); }
+    return r;
+}
+
+/* malloc'd copy of `path` with trailing '/' and '\\' trimmed (never to empty). */
+static char *strip_trailing_sep(const char *path) {
+    size_t n = strlen(path);
+    while (n > 1 && (path[n-1] == '/' || path[n-1] == '\\')) n--;
+    char *r = (char*)malloc(n + 1);
+    if (!r) return NULL;
+    memcpy(r, path, n); r[n] = '\0';
+    return r;
+}
+
+/* A stored path is safe iff it is relative and every component is non-empty,
+ * not "." or "..", and free of ':' and '\\' — so an archive can never write
+ * outside the extraction root. */
+static int arc_path_safe(const char *p, size_t n) {
+    if (n == 0 || p[0] == '/') return 0;
+    for (size_t i = 0; i < n; ) {
+        size_t j = i;
+        while (j < n && p[j] != '/') j++;
+        size_t clen = j - i;
+        if (clen == 0) return 0;
+        if (clen == 1 && p[i] == '.') return 0;
+        if (clen == 2 && p[i] == '.' && p[i+1] == '.') return 0;
+        for (size_t k = i; k < j; k++)
+            if (p[k] == '\\' || p[k] == ':' || p[k] == '\0') return 0;
+        i = (j < n) ? j + 1 : j;
+    }
+    return 1;
+}
+
+/* ---------------- filesystem probes -------------------------------------- */
+static int path_is_dir(const char *p) {
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat s;
+    return stat(p, &s) == 0 && S_ISDIR(s.st_mode);
+#endif
+}
+static int path_is_regular(const char *p) {
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+    struct stat s;
+    return stat(p, &s) == 0 && S_ISREG(s.st_mode);
+#endif
+}
+static unsigned path_mode(const char *p, unsigned dflt) {
+#if defined(_WIN32)
+    (void)p; return dflt;
+#else
+    struct stat s;
+    return stat(p, &s) == 0 ? (unsigned)(s.st_mode & 0777) : dflt;
+#endif
+}
+static u64 path_size(const char *p) {
+#if defined(_WIN32)
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (GetFileAttributesExA(p, GetFileExInfoStandard, &d))
+        return ((u64)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+    return 0;
+#else
+    struct stat s;
+    return stat(p, &s) == 0 ? (u64)s.st_size : 0;
+#endif
+}
+
+/* Create one directory; success if it already exists. */
+static int make_dir(const char *p) {
+#if defined(_WIN32)
+    if (_mkdir(p) == 0) return 0;
+#else
+    if (mkdir(p, 0777) == 0) return 0;
+#endif
+    return errno == EEXIST ? 0 : -1;
+}
+
+/* Create out_root and every directory along the relative path `rel`. When
+ * include_last is 0, stop before rel's final component (create parents only,
+ * for a file); when 1, create rel itself too (a directory entry). */
+static int make_dirs(const char *out_root, const char *rel, int include_last) {
+    if (make_dir(out_root) != 0) return -1;
+    size_t rl = strlen(out_root);
+    char *w = (char*)malloc(rl + 1 + strlen(rel) + 1);
+    if (!w) return -1;
+    memcpy(w, out_root, rl); w[rl] = '\0';
+    size_t wl = rl;
+    int rc = 0;
+    for (const char *c = rel; *c; ) {
+        const char *slash = strchr(c, '/');
+        size_t clen = slash ? (size_t)(slash - c) : strlen(c);
+        if (!slash && !include_last) break;
+        w[wl++] = '/';
+        memcpy(w + wl, c, clen); wl += clen; w[wl] = '\0';
+        if (make_dir(w) != 0) { rc = -1; break; }
+        if (!slash) break;
+        c = slash + 1;
+    }
+    free(w);
+    return rc;
+}
+
+/* Write `n` bytes to `path`, applying unix `mode` where supported. */
+static int write_file_bytes(const char *path, const u8 *d, size_t n, unsigned mode) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int ok = !(n && fwrite(d, 1, n, f) != n);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(path); return -1; }
+#if !defined(_WIN32)
+    if (mode) chmod(path, (mode_t)(mode & 0777));
+#else
+    (void)mode;
+#endif
+    return 0;
+}
+
+/* ---------------- directory listing (sorted, reproducible) --------------- */
+static int name_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+static void free_names(char **names, size_t n) {
+    for (size_t i = 0; i < n; i++) free(names[i]);
+    free(names);
+}
+static int add_name(char ***a, size_t *n, size_t *cap, const char *nm) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        char **np = (char**)realloc(*a, nc * sizeof *np);
+        if (!np) return -1;
+        *a = np; *cap = nc;
+    }
+    size_t l = strlen(nm);
+    char *copy = (char*)malloc(l + 1);
+    if (!copy) return -1;
+    memcpy(copy, nm, l + 1);
+    (*a)[(*n)++] = copy;
+    return 0;
+}
+static int list_dir(const char *dir, char ***out, size_t *out_n) {
+    char **names = NULL; size_t n = 0, cap = 0;
+    *out = NULL; *out_n = 0;
+#if defined(_WIN32)
+    char *pat = path_join(dir, "*");
+    if (!pat) return -1;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    free(pat);
+    if (h == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    do {
+        const char *nm = fd.cFileName;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+        if (add_name(&names, &n, &cap, nm) != 0) {
+            FindClose(h); free_names(names, n); return -1;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *nm = e->d_name;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+        if (add_name(&names, &n, &cap, nm) != 0) {
+            closedir(d); free_names(names, n); return -1;
+        }
+    }
+    closedir(d);
+#endif
+    if (n > 1) qsort(names, n, sizeof *names, name_cmp);
+    *out = names; *out_n = n;
+    return 0;
+}
+
+/* ---------------- entry list (shared by writer and reader) --------------- */
+typedef struct { u8 type; u32 mode; u64 orig, coff, csize; char *path; } arc_ent;
+typedef struct { arc_ent *e; size_t n, cap; } arc_list;
+
+static void arc_list_free(arc_list *L) {
+    for (size_t i = 0; i < L->n; i++) free(L->e[i].path);
+    free(L->e);
+    L->e = NULL; L->n = L->cap = 0;
+}
+/* Takes ownership of `path` (freed by arc_list_free); frees it on OOM. */
+static int arc_list_add(arc_list *L, u8 type, u32 mode, u64 orig, char *path) {
+    if (L->n == L->cap) {
+        size_t nc = L->cap ? L->cap * 2 : 32;
+        arc_ent *ne = (arc_ent*)realloc(L->e, nc * sizeof *ne);
+        if (!ne) { free(path); return -1; }
+        L->e = ne; L->cap = nc;
+    }
+    arc_ent *en = &L->e[L->n++];
+    en->type = type; en->mode = mode; en->orig = orig;
+    en->coff = 0; en->csize = 0; en->path = path;
+    return 0;
+}
+
+/* ---------------- writer ------------------------------------------------- */
+
+/* Walk fs_dir, appending each member (dirs before their contents, siblings
+ * sorted) to L with its archive-relative path arc_pre/<name>; sum file sizes
+ * into *total. Does not read file contents. */
+static int arc_scan(const char *fs_dir, const char *arc_pre,
+                    arc_list *L, u64 *total) {
+    char **names; size_t n;
+    if (list_dir(fs_dir, &names, &n) != 0) return SQUISH_E_IO;
+    int rc = SQUISH_OK;
+    for (size_t i = 0; i < n && rc == SQUISH_OK; i++) {
+        char *fs  = path_join(fs_dir, names[i]);
+        char *arc = path_join(arc_pre, names[i]);
+        if (!fs || !arc) { free(fs); free(arc); rc = SQUISH_E_NOMEM; break; }
+        if (strlen(arc) > SQAR_MAX_PATH) { free(fs); free(arc); rc = SQUISH_E_FORMAT; break; }
+        if (path_is_dir(fs)) {
+            if (arc_list_add(L, 1, path_mode(fs, 0755), 0, arc) != 0) {
+                rc = SQUISH_E_NOMEM;
+            } else {
+                rc = arc_scan(fs, L->e[L->n - 1].path, L, total);  /* arc owned by L */
+            }
+        } else if (path_is_regular(fs)) {
+            u64 sz = path_size(fs);
+            if (arc_list_add(L, 0, path_mode(fs, 0644), sz, arc) != 0) rc = SQUISH_E_NOMEM;
+            else *total += sz;
+        } else {
+            free(arc);      /* skip sockets/fifos/dangling links */
+        }
+        free(fs);
+    }
+    free_names(names, n);
+    return rc;
+}
+
+/* Serialize L's metadata into a fresh index buffer (caller frees idx->p). */
+static int arc_build_index(const arc_list *L, gbuf *idx) {
+    for (size_t i = 0; i < L->n; i++) {
+        const arc_ent *e = &L->e[i];
+        size_t plen = strlen(e->path);
+        if (gbuf_u8(idx, e->type) || gbuf_u32(idx, e->mode) ||
+            gbuf_u64(idx, e->orig) || gbuf_u64(idx, e->coff) ||
+            gbuf_u64(idx, e->csize) || gbuf_u32(idx, (u32)plen) ||
+            gbuf_put(idx, e->path, plen))
+            return SQUISH_E_NOMEM;
+    }
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_create(const char *dir_path,
+                                     const char *archive_path,
+                                     int nthreads, size_t chunk_size,
+                                     squish_progress_fn cb, void *user) {
+    if (!dir_path || !archive_path) return SQUISH_E_PARAM;
+    char *root = strip_trailing_sep(dir_path);
+    if (!root) return SQUISH_E_NOMEM;
+
+    arc_list L = { NULL, 0, 0 };
+    u64 total = 0;
+    int rc = arc_scan(root, "", &L, &total);
+    if (rc != SQUISH_OK) { arc_list_free(&L); free(root); return rc; }
+
+    FILE *f = fopen(archive_path, "wb+");
+    if (!f) { arc_list_free(&L); free(root); return SQUISH_E_IO; }
+
+    /* header placeholder: magic + version now, counts/offsets patched at end */
+    u8 hdr[SQAR_HDR];
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, SQAR_MAGIC, 8);
+    put_le(hdr + 8, SQAR_VERSION, 4);
+    if (fwrite(hdr, 1, SQAR_HDR, f) != SQAR_HDR) { rc = SQUISH_E_IO; goto done; }
+    u64 off = SQAR_HDR, processed = 0;
+
+    for (size_t i = 0; i < L.n; i++) {
+        arc_ent *e = &L.e[i];
+        if (e->type != 0) continue;                 /* directories: metadata only */
+        char *fs = path_join(root, e->path);
+        if (!fs) { rc = SQUISH_E_NOMEM; goto done; }
+        u8 *data; size_t dl;
+        rc = read_whole(fs, &data, &dl);
+        free(fs);
+        if (rc != SQUISH_OK) goto done;
+        void *comp; size_t cl;
+        rc = squish_compress_alloc_mt(data, dl, &comp, &cl,
+                                      nthreads, chunk_size, NULL, NULL);
+        free(data);
+        if (rc != SQUISH_OK) goto done;
+        int ok = (cl == 0) || (fwrite(comp, 1, cl, f) == cl);
+        squish_free(comp);
+        if (!ok) { rc = SQUISH_E_IO; goto done; }
+        e->coff = off; e->csize = cl; e->orig = dl;
+        off += cl;
+        processed += dl;
+        if (cb) cb(processed, total, user);
+    }
+
+    {   /* index: build, compress, append */
+        gbuf idx = { NULL, 0, 0 };
+        rc = arc_build_index(&L, &idx);
+        if (rc != SQUISH_OK) { free(idx.p); goto done; }
+        void *ic; size_t icl;
+        u8 empty = 0;
+        rc = squish_compress_alloc(idx.len ? idx.p : &empty, idx.len, &ic, &icl);
+        u64 idx_orig = idx.len;
+        free(idx.p);
+        if (rc != SQUISH_OK) goto done;
+        int ok = (icl == 0) || (fwrite(ic, 1, icl, f) == icl);
+        squish_free(ic);
+        if (!ok) { rc = SQUISH_E_IO; goto done; }
+
+        put_le(hdr + 16, (u64)L.n, 8);
+        put_le(hdr + 24, total, 8);
+        put_le(hdr + 32, off, 8);              /* index offset */
+        put_le(hdr + 40, icl, 8);              /* index compressed size */
+        put_le(hdr + 48, idx_orig, 8);         /* index original size */
+        if (sq_fseek64(f, 0) != 0 || fwrite(hdr, 1, SQAR_HDR, f) != SQAR_HDR)
+            rc = SQUISH_E_IO;
+    }
+    if (rc == SQUISH_OK && cb) cb(total, total, user);
+
+done:
+    if (fclose(f) != 0 && rc == SQUISH_OK) rc = SQUISH_E_IO;
+    if (rc != SQUISH_OK) remove(archive_path);
+    arc_list_free(&L);
+    free(root);
+    return rc;
+}
+
+/* ---------------- reader ------------------------------------------------- */
+struct squish_archive {
+    FILE     *f;                 /* file-backed; NULL when memory-backed   */
+    const u8 *mem; size_t mem_len;
+    u64       filesize;
+    u32       version, flags;
+    u64       total_size, index_off;
+    arc_ent  *ents; u64 nents;   /* coff/csize/orig/mode/type/path per member */
+};
+
+/* Copy [off,off+len) of the archive into a fresh buffer, or (memory-backed)
+ * point directly at it. *owned is set to a malloc'd buffer the caller frees,
+ * or NULL when the pointer is borrowed from the mapped image. */
+static int arc_range(squish_archive *a, u64 off, u64 len,
+                     const u8 **pp, u8 **owned) {
+    *owned = NULL;
+    if (off > a->filesize || len > a->filesize - off) return SQUISH_E_FORMAT;
+    if (a->mem) { *pp = a->mem + off; return SQUISH_OK; }
+    if (len > (size_t)-1) return SQUISH_E_NOMEM;
+    u8 *buf = (u8*)malloc(len ? (size_t)len : 1);
+    if (!buf) return SQUISH_E_NOMEM;
+    if (len && (sq_fseek64(a->f, off) != 0 ||
+                fread(buf, 1, (size_t)len, a->f) != (size_t)len)) {
+        free(buf); return SQUISH_E_IO;
+    }
+    *pp = buf; *owned = buf;
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_probe(const void *data, size_t len) {
+    const u8 *p = (const u8*)data;
+    return p && len >= 12 && memcmp(p, SQAR_MAGIC, 8) == 0 &&
+           get_le(p + 8, 4) == SQAR_VERSION;
+}
+
+/* Parse the header + decompressed index into a->ents. Returns a status. */
+static int arc_parse(squish_archive *a) {
+    u8 hdr[SQAR_HDR];
+    const u8 *hp;
+    if (a->mem) {
+        if (a->mem_len < SQAR_HDR) return SQUISH_E_FORMAT;
+        hp = a->mem;
+    } else {
+        if (a->filesize < SQAR_HDR) return SQUISH_E_FORMAT;
+        if (sq_fseek64(a->f, 0) != 0 || fread(hdr, 1, SQAR_HDR, a->f) != SQAR_HDR)
+            return SQUISH_E_IO;
+        hp = hdr;
+    }
+    if (memcmp(hp, SQAR_MAGIC, 8) != 0 || get_le(hp + 8, 4) != SQAR_VERSION)
+        return SQUISH_E_FORMAT;
+    a->version    = (u32)get_le(hp + 8, 4);
+    a->flags      = (u32)get_le(hp + 12, 4);
+    u64 count     = get_le(hp + 16, 8);
+    a->total_size = get_le(hp + 24, 8);
+    a->index_off  = get_le(hp + 32, 8);
+    u64 icl       = get_le(hp + 40, 8);
+    u64 iorig     = get_le(hp + 48, 8);
+
+    /* index blob must sit wholly after the header and inside the file */
+    if (a->index_off < SQAR_HDR || icl > a->filesize - a->index_off)
+        return SQUISH_E_FORMAT;
+    /* every entry costs at least SQAR_ENT_FIXED + 1 bytes, so this bounds the
+     * index allocation against a forged count */
+    if (iorig >= SQUISH_MAX_INPUT || count > iorig / (SQAR_ENT_FIXED + 1))
+        return SQUISH_E_FORMAT;
+
+    const u8 *ip; u8 *iown;
+    int rc = arc_range(a, a->index_off, icl, &ip, &iown);
+    if (rc != SQUISH_OK) return rc;
+    void *idx = NULL; size_t idn = 0;
+    rc = squish_decompress_alloc(ip, (size_t)icl, &idx, &idn);
+    free(iown);
+    if (rc != SQUISH_OK) return rc == SQUISH_E_CHECKSUM ? SQUISH_E_FORMAT : rc;
+    if (idn != iorig) { squish_free(idx); return SQUISH_E_FORMAT; }
+
+    a->ents = (arc_ent*)calloc(count ? (size_t)count : 1, sizeof(arc_ent));
+    if (!a->ents) { squish_free(idx); return SQUISH_E_NOMEM; }
+
+    const u8 *b = (const u8*)idx;
+    size_t o = 0;
+    rc = SQUISH_OK;
+    for (u64 i = 0; i < count; i++) {
+        if (idn - o < SQAR_ENT_FIXED) { rc = SQUISH_E_FORMAT; break; }
+        arc_ent *e = &a->ents[i];
+        e->type  = b[o];
+        e->mode  = (u32)get_le(b + o + 1, 4);
+        e->orig  = get_le(b + o + 5, 8);
+        e->coff  = get_le(b + o + 13, 8);
+        e->csize = get_le(b + o + 21, 8);
+        u32 plen = (u32)get_le(b + o + 29, 4);
+        o += SQAR_ENT_FIXED;
+        if (plen == 0 || plen > SQAR_MAX_PATH || plen > idn - o) { rc = SQUISH_E_FORMAT; break; }
+        if (!arc_path_safe((const char*)(b + o), plen)) { rc = SQUISH_E_FORMAT; break; }
+        e->path = (char*)malloc((size_t)plen + 1);
+        if (!e->path) { rc = SQUISH_E_NOMEM; break; }
+        memcpy(e->path, b + o, plen); e->path[plen] = '\0';
+        o += plen;
+        a->nents = i + 1;                       /* so cleanup frees this path */
+        if (e->type == 1) {
+            if (e->orig || e->coff || e->csize) { rc = SQUISH_E_FORMAT; break; }
+        } else if (e->type == 0) {
+            /* member stream must lie inside the data region [HDR, index_off) */
+            if (e->coff < SQAR_HDR || e->csize > a->index_off - e->coff ||
+                e->csize < OVERHEAD) { rc = SQUISH_E_FORMAT; break; }
+        } else { rc = SQUISH_E_FORMAT; break; }
+    }
+    if (rc == SQUISH_OK && o != idn) rc = SQUISH_E_FORMAT;   /* must tile */
+    squish_free(idx);
+    return rc;
+}
+
+static void arc_reader_free(squish_archive *a) {
+    if (!a) return;
+    if (a->f) fclose(a->f);
+    if (a->ents) for (u64 i = 0; i < a->nents; i++) free(a->ents[i].path);
+    free(a->ents);
+    free(a);
+}
+
+SQUISH_API int squish_archive_open(const char *path, squish_archive **out) {
+    if (!path || !out) return SQUISH_E_PARAM;
+    *out = NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return SQUISH_E_IO;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return SQUISH_E_IO; }
+    long long sz = sq_ftell64(f);
+    if (sz < 0) { fclose(f); return SQUISH_E_IO; }
+    squish_archive *a = (squish_archive*)calloc(1, sizeof *a);
+    if (!a) { fclose(f); return SQUISH_E_NOMEM; }
+    a->f = f; a->filesize = (u64)sz;
+    int rc = arc_parse(a);
+    if (rc != SQUISH_OK) { arc_reader_free(a); return rc; }
+    *out = a;
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_open_memory(const void *data, size_t len,
+                                          squish_archive **out) {
+    if (!data || !out) return SQUISH_E_PARAM;
+    *out = NULL;
+    squish_archive *a = (squish_archive*)calloc(1, sizeof *a);
+    if (!a) return SQUISH_E_NOMEM;
+    a->mem = (const u8*)data; a->mem_len = len; a->filesize = len;
+    int rc = arc_parse(a);
+    if (rc != SQUISH_OK) { arc_reader_free(a); return rc; }
+    *out = a;
+    return SQUISH_OK;
+}
+
+SQUISH_API void squish_archive_close(squish_archive *a) { arc_reader_free(a); }
+
+SQUISH_API int squish_archive_info_get(const squish_archive *a,
+                                       squish_archive_info *out) {
+    if (!a || !out) return SQUISH_E_PARAM;
+    out->version = a->version; out->flags = a->flags;
+    out->entry_count = a->nents; out->total_size = a->total_size;
+    return SQUISH_OK;
+}
+
+SQUISH_API uint64_t squish_archive_count(const squish_archive *a) {
+    return a ? a->nents : 0;
+}
+
+SQUISH_API int squish_archive_stat(const squish_archive *a, uint64_t index,
+                                   squish_archive_entry *out) {
+    if (!a || !out || index >= a->nents) return SQUISH_E_PARAM;
+    const arc_ent *e = &a->ents[index];
+    out->path = e->path;
+    out->size = e->orig;
+    out->stored_size = e->csize;
+    out->mode = e->mode;
+    out->is_dir = (e->type == 1);
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_find(const squish_archive *a,
+                                   const char *path, uint64_t *index_out) {
+    if (!a || !path) return SQUISH_E_PARAM;
+    size_t n = strlen(path);
+    while (n > 1 && path[n-1] == '/') n--;              /* tolerate trailing / */
+    for (u64 i = 0; i < a->nents; i++)
+        if (strlen(a->ents[i].path) == n && memcmp(a->ents[i].path, path, n) == 0) {
+            if (index_out) *index_out = i;
+            return SQUISH_OK;
+        }
+    return SQUISH_E_FORMAT;
+}
+
+SQUISH_API int squish_archive_extract(squish_archive *a, uint64_t index,
+                                      void **out, size_t *out_len) {
+    if (!a || !out || !out_len) return SQUISH_E_PARAM;
+    *out = NULL; *out_len = 0;
+    if (index >= a->nents) return SQUISH_E_PARAM;
+    const arc_ent *e = &a->ents[index];
+    if (e->type != 0) return SQUISH_E_PARAM;            /* directory */
+    const u8 *cp; u8 *own;
+    int rc = arc_range(a, e->coff, e->csize, &cp, &own);
+    if (rc != SQUISH_OK) return rc;
+    void *dec; size_t dn;
+    rc = squish_decompress_alloc_mt(cp, (size_t)e->csize, &dec, &dn, 0, NULL, NULL);
+    free(own);
+    if (rc != SQUISH_OK) return rc;
+    if (dn != e->orig) { squish_free(dec); return SQUISH_E_FORMAT; }
+    *out = dec; *out_len = dn;
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_extract_path(squish_archive *a, const char *path,
+                                           void **out, size_t *out_len) {
+    if (!a || !path || !out || !out_len) return SQUISH_E_PARAM;
+    *out = NULL; *out_len = 0;
+    uint64_t i;
+    int rc = squish_archive_find(a, path, &i);
+    if (rc != SQUISH_OK) return rc;
+    return squish_archive_extract(a, i, out, out_len);
+}
+
+SQUISH_API int squish_archive_extract_to_file(squish_archive *a,
+                                              const char *path,
+                                              const char *dst_path) {
+    if (!a || !path || !dst_path) return SQUISH_E_PARAM;
+    uint64_t i;
+    int rc = squish_archive_find(a, path, &i);
+    if (rc != SQUISH_OK) return rc;
+    if (a->ents[i].type != 0) return SQUISH_E_PARAM;
+    void *buf; size_t n;
+    rc = squish_archive_extract(a, i, &buf, &n);
+    if (rc != SQUISH_OK) return rc;
+    rc = write_file_bytes(dst_path, (const u8*)buf, n, a->ents[i].mode) == 0
+             ? SQUISH_OK : SQUISH_E_IO;
+    squish_free(buf);
+    return rc;
+}
+
+/* True if member path `p` is `prefix` itself or lies beneath it. */
+static int under_prefix(const char *p, const char *prefix, size_t plen) {
+    if (plen == 0) return 1;
+    if (strncmp(p, prefix, plen) != 0) return 0;
+    return p[plen] == '\0' || p[plen] == '/';
+}
+
+SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
+                                              const char *prefix,
+                                              const char *dst_root,
+                                              squish_progress_fn cb, void *user) {
+    if (!a || !dst_root) return SQUISH_E_PARAM;
+    char pbuf[SQAR_MAX_PATH + 1];
+    size_t plen = 0;
+    if (prefix && *prefix) {
+        plen = strlen(prefix);
+        while (plen > 1 && prefix[plen-1] == '/') plen--;
+        if (plen > SQAR_MAX_PATH) return SQUISH_E_FORMAT;
+        memcpy(pbuf, prefix, plen); pbuf[plen] = '\0';
+    }
+    const char *pfx = plen ? pbuf : "";
+
+    u64 total = 0, processed = 0;
+    int matched = 0;
+    for (u64 i = 0; i < a->nents; i++)
+        if (under_prefix(a->ents[i].path, pfx, plen)) {
+            matched = 1;
+            if (a->ents[i].type == 0) total += a->ents[i].orig;
+        }
+    if (!matched && plen) return SQUISH_E_FORMAT;      /* no such member */
+    if (make_dir(dst_root) != 0) return SQUISH_E_IO;
+
+    int rc = SQUISH_OK;
+    for (u64 i = 0; i < a->nents && rc == SQUISH_OK; i++) {
+        const arc_ent *e = &a->ents[i];
+        if (!under_prefix(e->path, pfx, plen)) continue;
+        if (e->type == 1) {
+            if (make_dirs(dst_root, e->path, 1) != 0) rc = SQUISH_E_IO;
+        } else {
+            char *full = path_join(dst_root, e->path);
+            if (!full) { rc = SQUISH_E_NOMEM; break; }
+            void *buf; size_t n;
+            rc = squish_archive_extract(a, i, &buf, &n);
+            if (rc == SQUISH_OK) {
+                if (make_dirs(dst_root, e->path, 0) != 0 ||
+                    write_file_bytes(full, (const u8*)buf, n, e->mode) != 0)
+                    rc = SQUISH_E_IO;
+                squish_free(buf);
+                processed += e->orig;
+                if (rc == SQUISH_OK && cb) cb(processed, total, user);
+            }
+            free(full);
+        }
+    }
+    return rc;
+}
