@@ -13,41 +13,64 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Merge baselines.csv + squish.csv into a comparison table (markdown)."""
+"""Merge baselines.csv + squish.csv into comparison tables (markdown).
+
+Two tables are emitted:
+  1. SQUISH (ratio-optimal single-block) versus zip/bzip2/rar/xz.
+  2. SQUISH's own modes head to head: single-block, multi-threaded, and the
+     self-extracting executable (size, compress/decompress time, verified).
+"""
 import csv
 import os
+import sys
 from collections import defaultdict
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS = ["zip", "bzip2", "rar", "xz", "squish"]
+# The tables use "Δ" and em-dashes; keep them intact on Windows' cp1252 stdout.
+sys.stdout.reconfigure(encoding="utf-8")
 
-data = defaultdict(dict)   # file -> tool -> (orig, comp, ct)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RIVALS = ["zip", "bzip2", "rar", "xz"]
+MODES = ["squish-single", "squish-mt", "squish-sfx"]
+
+# file -> tool -> (orig, comp, compress_s, decompress_s)
+data = defaultdict(dict)
 for path in ("baselines.csv", "squish.csv"):
     with open(os.path.join(ROOT, "bench", path)) as fh:
         for row in csv.DictReader(fh):
             data[row["file"]][row["tool"]] = (
                 int(row["orig_bytes"]), int(row["comp_bytes"]),
-                float(row["compress_s"]))
+                float(row["compress_s"]),
+                float(row.get("decompress_s") or 0.0))
 
-files = [f for f in data if all(t in data[f] for t in TOOLS)]
-files.sort(key=lambda f: -data[f]["zip"][0])
 
+def order(files):
+    return sorted(files, key=lambda f: -data[f]["squish-single"][0])
+
+
+# ---------------------------------------------------------------------------
+# Table 1: SQUISH vs the field
+# ---------------------------------------------------------------------------
+cols = RIVALS + ["squish-single"]
+files = order([f for f in data if all(t in data[f] for t in cols)])
+
+print("### SQUISH vs zip / bzip2 / rar / xz\n")
+print("Ratio-optimal single-block SQUISH against each rival's strongest setting.\n")
 print("| file | orig | zip -9 | bzip2 -9 | rar -m5 | xz -9e | SQUISH | vs best rival |")
 print("|---|---:|---:|---:|---:|---:|---:|---:|")
 tot = defaultdict(int); orig_tot = 0
 wins_all = wins_named = 0
 for f in files:
-    orig = data[f]["zip"][0]; orig_tot += orig
-    sizes = {t: data[f][t][1] for t in TOOLS}
-    for t in TOOLS: tot[t] += sizes[t]
-    best_rival = min(sizes[t] for t in ("zip", "bzip2", "rar", "xz"))
+    orig = data[f]["squish-single"][0]; orig_tot += orig
+    sizes = {t: data[f][t][1] for t in cols}
+    for t in cols: tot[t] += sizes[t]
+    best_rival = min(sizes[t] for t in RIVALS)
     named_rival = min(sizes[t] for t in ("zip", "bzip2", "rar"))
-    sq = sizes["squish"]
+    sq = sizes["squish-single"]
     if sq < best_rival: wins_all += 1
     if sq < named_rival: wins_named += 1
     delta = 100.0 * (best_rival - sq) / best_rival
     row = [f, f"{orig:,}"]
-    for t in TOOLS:
+    for t in cols:
         s = f"{sizes[t]:,}"
         if sizes[t] == min(sizes.values()): s = f"**{s}**"
         row.append(s)
@@ -56,16 +79,70 @@ for f in files:
 
 row = ["**TOTAL**", f"{orig_tot:,}"]
 best_tot = min(tot.values())
-for t in TOOLS:
+for t in cols:
     s = f"{tot[t]:,}"
     if tot[t] == best_tot: s = f"**{s}**"
     row.append(s)
-row.append(f"{100.0*(min(tot[t] for t in ('zip','bzip2','rar','xz'))-tot['squish'])/min(tot[t] for t in ('zip','bzip2','rar','xz')):+.1f}%")
+best_rival_tot = min(tot[t] for t in RIVALS)
+row.append(f"{100.0*(best_rival_tot-tot['squish-single'])/best_rival_tot:+.1f}%")
 print("| " + " | ".join(row) + " |")
 
 n = len(files)
 print()
 print(f"SQUISH beats zip+bzip2+rar on {wins_named}/{n} files; "
       f"beats all four (incl. xz -9e) on {wins_all}/{n}.")
-for t in TOOLS:
-    print(f"  {t:7s} total {tot[t]:>12,}  ratio {tot[t]/orig_tot:.4f}")
+for t in cols:
+    label = "squish" if t == "squish-single" else t
+    print(f"  {label:7s} total {tot[t]:>12,}  ratio {tot[t]/orig_tot:.4f}")
+
+# ---------------------------------------------------------------------------
+# Table 2: SQUISH modes head to head
+# ---------------------------------------------------------------------------
+mfiles = order([f for f in data if all(t in data[f] for t in MODES)])
+
+print()
+print("### SQUISH compression modes\n")
+print("Same corpus, three ways to run SQUISH. `single` is the ratio-optimal "
+      "single-block stream; `mt` splits into blocks across all cores (a little "
+      "ratio for a lot of speed); `sfx` is a standalone self-extracting "
+      "executable — its size includes the ~212 KB extractor stub, and its "
+      "round-trip is the stub actually running.\n")
+print("| file | orig | single | c/d s | mt | c/d s | mt Δsize | mt speedup | "
+      "sfx (with stub) | extract s |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+mtot = defaultdict(int); morig = 0
+ct_tot = defaultdict(float); dt_tot = defaultdict(float)
+for f in mfiles:
+    o, s_sz, s_ct, s_dt = data[f]["squish-single"]
+    _, m_sz, m_ct, m_dt = data[f]["squish-mt"]
+    _, x_sz, x_ct, x_dt = data[f]["squish-sfx"]
+    morig += o
+    mtot["single"] += s_sz; mtot["mt"] += m_sz; mtot["sfx"] += x_sz
+    ct_tot["single"] += s_ct; ct_tot["mt"] += m_ct
+    dt_tot["single"] += s_dt; dt_tot["mt"] += m_dt
+    dsize = 100.0 * (m_sz - s_sz) / s_sz
+    speed = s_ct / m_ct if m_ct else 0.0
+    print("| " + " | ".join([
+        f, f"{o:,}",
+        f"{s_sz:,}", f"{s_ct:.1f}/{s_dt:.1f}",
+        f"{m_sz:,}", f"{m_ct:.1f}/{m_dt:.1f}",
+        f"{dsize:+.1f}%", f"{speed:.2f}x",
+        f"{x_sz:,}", f"{x_dt:.1f}",
+    ]) + " |")
+
+dsize_tot = 100.0 * (mtot["mt"] - mtot["single"]) / mtot["single"]
+speed_tot = ct_tot["single"] / ct_tot["mt"] if ct_tot["mt"] else 0.0
+print("| " + " | ".join([
+    "**TOTAL**", f"{morig:,}",
+    f"**{mtot['single']:,}**", f"{ct_tot['single']:.0f}/{dt_tot['single']:.0f}",
+    f"{mtot['mt']:,}", f"{ct_tot['mt']:.0f}/{dt_tot['mt']:.0f}",
+    f"{dsize_tot:+.1f}%", f"{speed_tot:.2f}x",
+    f"{mtot['sfx']:,}", "",
+]) + " |")
+print()
+print(f"  single  {mtot['single']:>12,}  ratio {mtot['single']/morig:.4f}  "
+      f"({ct_tot['single']:.0f}s compress)")
+print(f"  mt      {mtot['mt']:>12,}  ratio {mtot['mt']/morig:.4f}  "
+      f"({ct_tot['mt']:.0f}s compress, {speed_tot:.2f}x faster, {dsize_tot:+.1f}% size)")
+print(f"  sfx     {mtot['sfx']:>12,}  ratio {mtot['sfx']/morig:.4f}  "
+      f"(+{mtot['sfx']-mtot['single']:,} bytes of stubs over single)")
