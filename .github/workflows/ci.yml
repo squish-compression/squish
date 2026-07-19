@@ -97,8 +97,34 @@ jobs:
       #      repo, and a role granting access to the Trusted Signing account)
       #   Variables: TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT,
       #     TRUSTED_SIGNING_PROFILE
-      - name: Azure login (OIDC federated)
+      #
+      # Until those are configured the signing steps below are skipped (not
+      # failed), so main stays green. The check reads the values via env — the
+      # secrets context can't be tested directly in an `if:` — and gates the
+      # rest on its `enabled` output.
+      - name: Check Trusted Signing config
+        id: signcfg
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TS_ENDPOINT: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          TS_PROFILE: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+        run: |
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ] && \
+             [ -n "$AZURE_SUBSCRIPTION_ID" ] && [ -n "$TS_ENDPOINT" ] && \
+             [ -n "$TS_ACCOUNT" ] && [ -n "$TS_PROFILE" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Azure Trusted Signing not configured (secrets/variables unset); skipping signing."
+          fi
+
+      - name: Azure login (OIDC federated)
+        if: steps.signcfg.outputs.enabled == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -106,7 +132,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign squish.exe + squish.dll (Azure Trusted Signing)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: steps.signcfg.outputs.enabled == 'true'
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
@@ -117,7 +143,7 @@ jobs:
             ${{ github.workspace }}\squish.dll
 
       - name: Upload signed binaries
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: steps.signcfg.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: squish-windows-signed
