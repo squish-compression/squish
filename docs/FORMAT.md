@@ -1,62 +1,97 @@
-# SQUISH stream formats "SQ02" and "SQ01"
+# The SQUISH archive format
 
-This document specifies the byte format completely enough to write an
-independent decoder. Because SQUISH is a context-mixing design, the
-container is trivial and the real specification is the **predictor**: the
-decoder must reproduce the encoder's probability for every bit exactly,
-which means every constant and update rule below is normative.
+SQUISH has one on-disk format: the **archive**. A lone file or buffer is a
+one-member archive; a directory is a many-member archive. This document
+specifies the bytes completely enough to write an independent decoder.
+Because SQUISH is a context-mixing design the container is trivial, and the
+real specification is the **predictor** (§§2–9): the decoder must reproduce
+the encoder's probability for every bit exactly, so every constant and update
+rule there is normative.
 
-There are two containers: `SQ02`, a single model stream, and `SQ01`
-(§1b), a multi-block wrapper holding independent `SQ02` streams so that
-chunks can be coded in parallel.
+An archive is a fixed 64-byte header, then the member data region (each file's
+contents as one or more coded blocks, concatenated), then a compressed index.
+A reader inflates the small index once and can then reach any member — or any
+block of a member — by seeking straight to it. All integers are little-endian.
 
-## 1. Container
+## 1. Archive container
 
 ```
 offset  size  field
-0       4     magic: 'S' 'Q' '0' '2'
-4       8     original size n, unsigned 64-bit little-endian
-12      1     mode: 0 = context-mixed arithmetic stream, 1 = stored
-13      ...   payload
-last    4     checksum: FNV-1a 64 of the n original bytes, low 32 bits, LE
+0       8     magic: 'S' 'Q' 'S' 'H' 0x0D 0x0A 0x1A 0x0A
+8       4     version u32 (currently 1)
+12      4     flags u32: bit 0 = SINGLE (one file/blob, not a packed tree)
+16      8     entry_count u64      (members: files + directories)
+24      8     total_size u64       (sum of member uncompressed sizes)
+32      8     chunk_size u64       (block size members were split at, >= 1)
+40      8     index_offset u64     (absolute offset of the index block)
+48      8     index_size u64       (index block length, bytes)
+56      8     index_orig_size u64  (index length after decompression)
+64      ...   member data region, then the index block at index_offset
 ```
 
-- Inputs are limited to n < 2^32 − 16.
-- `mode 1` (stored): payload is the n original bytes verbatim; total file
-  size is exactly n + 17. Encoders emit stored mode whenever the arithmetic
-  stream would be at least as large (guaranteeing the n + 17 bound).
-- `mode 0`: payload is the arithmetic-coded bitstream described below.
+The index is a single coded block (§1a) whose decoded bytes are `entry_count`
+entries in pre-order (directories before their contents, siblings sorted by
+name — so the archive depends only on the tree, not on directory iteration
+order). Each entry:
+
+```
+offset  size  field
+0       1     type: 0 = regular file, 1 = directory
+1       4     mode u32: unix permission bits (low 9); informational,
+              synthesized as 0644/0755 by producers without them
+5       8     orig_size u64   (uncompressed size; 0 for a directory)
+13      8     data_off u64    (offset of the member's first block; 0 for a
+                               directory or an empty file)
+21      4     path_len P u32
+25      ...   B block sizes, u64 each, where B = ceil(orig_size / chunk_size):
+              the compressed length of each block (none for a dir/empty file)
+...     P     path: relative, '/'-separated, UTF-8, no terminator. P may be 0
+              only for the lone unnamed member of a SINGLE blob archive.
+```
+
+A member's `B` blocks are stored contiguously from `data_off`; block *i*
+decompresses to `min(chunk_size, orig_size − i·chunk_size)` bytes, and its
+compressed length is the *i*-th size in the entry. The block count and every
+block's original size are therefore derived from `orig_size` and `chunk_size`
+— only the compressed sizes are stored.
+
+To read one member: decode the index block once, look the path up, then decode
+its blocks (in parallel if you like) straight from `data_off`. Each block
+verifies its own checksum (§1a), so there is no archive-level checksum.
+
+A reader must reject (as a format error): a wrong magic or version; a
+`chunk_size` of 0; an index block that does not lie wholly after the header and
+inside the file; entries that do not tile `index_orig_size` exactly; for a
+file, a block region not contained in `[64, index_offset)` or any block size
+below the 5-byte minimum; for a directory, any nonzero `orig_size`/`data_off`;
+and — so a member can never be written outside the extraction root — any path
+that is absolute or contains an empty, `.`, or `..` component or a `\` or `:`
+character.
+
+The `SINGLE` flag (bit 0 of `flags`) marks an archive that holds exactly one
+file member and is meant to be restored as a single file rather than unpacked
+into a directory; it is set when compressing one file or buffer and clear when
+packing a directory tree.
+
+## 1a. Coded block
+
+The atom of the format. A block holds up to `chunk_size` original bytes:
+
+```
+offset  size  field
+0       1     mode: 0 = context-mixed arithmetic stream, 1 = stored
+1       ...   payload
+last    4     checksum: FNV-1a 64 of the block's original bytes, low 32 bits, LE
+```
+
+- The block's original and compressed sizes come from the enclosing index, so
+  the block carries neither a magic nor a length.
+- `mode 1` (stored): payload is the original bytes verbatim; the block is
+  exactly `orig + 5` bytes. Encoders emit stored mode whenever the arithmetic
+  stream would be at least as large, which bounds any block at `orig + 5`.
+- `mode 0`: payload is the arithmetic-coded bitstream of §2.
 - FNV-1a 64: `h = 0xcbf29ce484222325; for each byte b: h ^= b; h *= 0x100000001b3`.
-
-## 1b. Multi-block container "SQ01"
-
-Produced by the multi-threaded encoder for inputs larger than one chunk.
-The payload is a sequence of complete, independent `SQ02` streams; models
-never carry state across chunk boundaries, which is what makes parallel
-encode and decode possible.
-
-```
-offset       size  field
-0            4     magic: 'S' 'Q' '0' '1'
-4            8     total original size n, unsigned 64-bit little-endian
-12           1     mode: 2 = multi-block
-13           4     chunk count k >= 1, unsigned 32-bit little-endian
-17           4*k   compressed size of each chunk, u32 LE each
-17 + 4*k     ...   k chunks, each a complete SQ02 stream (§1)
-```
-
-- Chunk i decodes to bytes `[sum of previous chunks' sizes ...)` of the
-  output; the original size of each chunk comes from its own SQ02 header.
-- The compressed sizes must tile the rest of the file exactly, and the
-  per-chunk original sizes must sum to n.
-- Chunks must be `SQ02` streams: nested `SQ01` containers are invalid.
-- There is no container-level checksum; each chunk carries its own (§1).
-- Encoders chunk the input at a fixed chunk size (encoder choice; the
-  reference default is 16 MiB, minimum 64 KiB), so the emitted stream
-  depends only on the input and the chunk size — never on the thread
-  count. An encoder that finds the multi-block stream no smaller than
-  stored mode emits a single stored-mode `SQ02` stream instead, which
-  preserves the n + 17 output bound.
+- A member is limited to fewer than 2^32 − 16 bytes.
 
 ## 2. Arithmetic coder
 
@@ -194,117 +229,9 @@ bit — predict, code, update, in that order, for encoder and decoder alike.
 
 ## 10. Versioning
 
-`SQ02` (single stream) and `SQ01` (multi-block, §1b) are the current
-versions. Any change to a constant, table size, initialization value, or
-update rule in §§2–9 produces incompatible streams and requires a new
-magic. (The magic `SQ01` previously named a pre-release single-stream
-format without the mode byte and checksum; that format was never released
-and no reader accepted it, so the magic has been reassigned to the
-multi-block container, which is distinguishable by its mode byte 2.)
-
-## 11. Self-extracting archive (CLI packaging)
-
-This section is **not** part of the compressed format; it describes how the
-`squish s` command wraps a payload in a runnable executable. For a single file
-the payload is an ordinary §1 stream; for a directory it is a whole `SQAR02`
-archive container (§12), embedded verbatim. The stub tells them apart by
-sniffing the payload's first bytes: the `SQAR02` magic means "unpack a tree",
-anything else means "decode one §1 stream". Either way the wrapper needs no
-stream-magic change.
-
-The archive is the platform's `squish` CLI binary (the *stub*) with three
-things appended:
-
-```
-offset            size      field
-0                 S         stub: the squish CLI executable, verbatim
-S                 P         payload: a §1 stream (file) or SQAR02 archive (dir)
-S + P             N         name: original basename, UTF-8, no terminator
-filesize - 32     32        trailer (below)
-```
-
-The trailer is fixed at 32 bytes; all integers are little-endian:
-
-```
-offset            size      field
-0                 8         magic: 'S' 'Q' 'S' 'F' 'X' '0' '1' 0x0A
-8                 8         payload offset S (= stub size), u64
-16                8         payload length P, u64
-24                4         name length N, u32 (≤ 4096)
-28                4         flags, u32 (0)
-```
-
-- Consistency, which a reader must verify: `S + P + N + 32 == filesize`, with
-  `S ≠ 0`, `P ≠ 0`, and `N ≤ 4096`.
-- The CLI recognizes an archive by reading its own trailing 32 bytes at
-  start-up and checking the magic and that identity; failing either, it runs
-  as the ordinary tool. The stub is statically linked, so the archive runs
-  with no libsquish present.
-- On extraction the stored name is reduced to its last path component (no
-  directory, drive, or `..`), so an archive cannot write outside the chosen
-  directory.
-- The trailer is independent of the stream format: changing it does not affect
-  stream compatibility, and it carries its own version byte (the `1` in the
-  magic) for future revisions.
-
-## 12. Seekable directory archive "SQAR02"
-
-Unlike §§1–10, this container is **not** a coded stream — it is a wrapper that
-holds many of them. It lets a directory tree be packed so that a reader can
-view the header, list members, and inflate one file (or one subtree) by
-**seeking straight to that member's stream**, never touching the rest. The
-tradeoff versus compressing the whole tree as one solid §1 stream: each file's
-model starts cold, so many tiny files compress a little worse.
-
-An archive is a fixed 56-byte header, then the member streams back to back,
-then a compressed index. All integers are little-endian:
-
-```
-offset  size  field
-0       8     magic: 'S' 'Q' 'A' 'R' '0' '2' 0x0A 0x1A
-8       4     version u32 (currently 2)
-12      4     flags u32 (0)
-16      8     entry_count u64
-24      8     total_size u64        (sum of member uncompressed sizes)
-32      8     index_offset u64      (absolute offset of the index blob)
-40      8     index_comp_size u64   (index blob length, bytes)
-48      8     index_orig_size u64   (index length after decompression)
-56      ...   member data region: each regular file's contents as a complete
-              §1 stream (SQ02, or SQ01 for files past one chunk), concatenated
-...     ...   index blob at index_offset: a §1 stream whose decoded bytes are
-              the entry table below
-```
-
-The index blob decodes to `entry_count` entries, in pre-order (directories
-before their contents, siblings sorted by name — so the archive depends only on
-the tree, not on directory iteration order). Each entry:
-
-```
-offset  size  field
-0       1     type: 0 = regular file, 1 = directory
-1       4     mode u32: unix permission bits (low 9); informational,
-              synthesized as 0644/0755 by producers without them
-5       8     orig_size u64      (uncompressed size; 0 for a directory)
-13      8     comp_offset u64    (offset of this file's stream; 0 for a dir)
-21      8     comp_size u64      (stream length in bytes; 0 for a directory)
-29      4     path_len P u32 (1 .. 65535)
-33      P     path: relative, '/'-separated, UTF-8, no terminator
-```
-
-- To read one member: decode the index blob once, look the path up, then decode
-  the single §1 stream at `[comp_offset, comp_offset + comp_size)`. That stream
-  carries and verifies its own checksum (§1), so there is no archive-level
-  checksum.
-- A reader must reject (as a format error): a wrong magic or version; an index
-  blob that does not lie wholly after the header and inside the file; entries
-  that do not tile `index_orig_size` exactly; for a file, a `[comp_offset,
-  comp_size)` range not contained in the member region `[56, index_offset)`;
-  for a directory, any nonzero `orig_size`/`comp_offset`/`comp_size`; and — as
-  in §11 — any path that is absolute or contains an empty, `.`, or `..`
-  component or a `\` or `:` character. The path rule is what stops a member
-  from being written outside the extraction root.
-- The header exposes `total_size` and `entry_count` for a cheap listing without
-  inflating any member; `index_orig_size` bounds the index allocation.
-- `SQAR01`, the pre-2 format, serialized the whole tree into one buffer and
-  compressed it as a single §1 stream — no random access. It was never released
-  and is not readable by version-2 tools; the magic distinguishes them.
+Version 1, magic `SQSH` followed by `\r\n\x1a\n`, is the current and only
+format. Any change to a constant, table size, initialization value, or update
+rule in §§2–9 produces incompatible blocks and requires a new version. The
+pre-release stream formats `SQ02`/`SQ01` and the archive formats
+`SQAR01`/`SQAR02` were never released and are not read by version-1 tools; the
+magic distinguishes them.

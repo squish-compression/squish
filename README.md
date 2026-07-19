@@ -25,8 +25,8 @@ verified. Full table in [bench/RESULTS.md](bench/RESULTS.md).
 | **SQUISH** | **67,430,251** | **0.214** |
 
 The trade: ~0.6 MB/s, symmetric (decompression costs the same as
-compression), and ~150 MB of model memory per stream. SQUISH spends CPU that
-zip/bzip2/rar don't and buys ratio with it.
+compression), and ~150 MB of model memory per active block. SQUISH spends CPU
+that zip/bzip2/rar don't and buys ratio with it.
 
 ## Build
 
@@ -46,60 +46,37 @@ No dependencies beyond libc/libm.
 ## CLI
 
 ```sh
-./squish c bigfile bigfile.sq          # compress
-./squish d bigfile.sq restored         # decompress (checksum-verified)
-./squish c project project.sqar        # pack a whole directory tree
-./squish l project.sqar                # list the archive's contents
-./squish x project.sqar src/main.c     # extract one file (or a subtree)
-./squish d project.sqar restored-dir   # recreate the whole tree under restored-dir
-./squish -t 0 c bigfile bigfile.sq     # compress on all cores (multi-block)
-./squish -t 0 -b 4 c big big.sq        # ... with 4 MiB blocks (more parallel,
+./squish c bigfile bigfile.sqsh        # compress a file
+./squish d bigfile.sqsh restored       # restore it (checksum-verified)
+./squish c project project.sqsh        # pack a whole directory tree
+./squish l project.sqsh                # list the archive's contents
+./squish x project.sqsh src/main.c     # extract one file (or a subtree)
+./squish d project.sqsh restored-dir   # recreate the whole tree under restored-dir
+./squish -t 0 c bigfile bigfile.sqsh   # compress on all cores
+./squish -t 0 -b 4 c big big.sqsh      # ... with 4 MiB blocks (more parallel,
                                        #     slightly worse ratio)
-./squish s report.pdf report.run       # make a self-extracting archive
-./report.run                           # ... run it to restore report.pdf
 ```
 
-`input` may be a file or a **directory**. A directory is packed into a
-**seekable `SQAR` archive** — every file compressed as its own stream, with
-directories, empty directories, and permission bits preserved. That lets `l`
-list the contents and `x` pull out a single file or subtree by seeking to just
-its stream, without inflating the rest; `d` recreates the whole tree under
-`output`. Extraction refuses absolute paths and `..`, so an archive never
-writes outside its target directory, and members are stored sorted, so the
-output depends only on the tree. The tradeoff for random access: each file's
-model starts cold, so many tiny files compress a little worse than one solid
-stream. Single files are compressed exactly as before. Library consumers get
+**Everything squish writes is one format: a SQUISH archive.** `input` may be a
+file or a **directory** — either way `output` is an archive, with every file
+compressed as its own member and directories, empty directories, and permission
+bits preserved. That lets `l` list the contents and `x` pull out a single file
+or subtree by seeking to just its blocks, without inflating the rest; `d`
+restores a single file, or recreates a whole tree under `output`. Extraction
+refuses absolute paths and `..`, so an archive never writes outside its target
+directory, and members are stored sorted, so the output depends only on the
+tree. The tradeoff for random access: each member's model starts cold, so many
+tiny files compress a little worse than one solid stream. Library consumers get
 the same operations through the `squish_archive_*` API; see
-[docs/API.md](docs/API.md) and [docs/FORMAT.md §12](docs/FORMAT.md).
+[docs/API.md](docs/API.md) and [docs/FORMAT.md](docs/FORMAT.md).
 
-`-t N` compresses with N threads (`0` = all cores) by splitting the input
+`-t N` compresses with N threads (`0` = all cores) by splitting each member
 into independently modeled blocks — near-linear speedup, at a small ratio
 cost because each block's model starts cold (about 1–2% at the default
 16 MiB blocks, more at smaller `-b` sizes). The default `-t 1` keeps the
-ratio-optimal single-block format used for the results table above.
-Decompression always uses all cores when the stream allows it (`-t` caps
-it) and reads both formats transparently. Budget ~150 MB of model memory
-per thread.
-
-The `s` command writes a **self-extracting archive**: `squish s input output`
-compresses `input` (a file or a directory tree) and produces an executable
-`output` that carries the compressed data. Running it — with no `squish` and
-no `libsquish` installed — decompresses (and checksum-verifies) the original
-back to its stored name in the current directory, or to a path you name;
-a directory archive unpacks the whole tree:
-
-```sh
-./squish s report.pdf report.run   # build (Linux: chmod +x is applied for you)
-./report.run                       # restore report.pdf here
-./report.run -f other.pdf          # ... or to a chosen path (-f to overwrite)
-```
-
-The archive is this CLI used as a stub with the payload appended, so it is
-platform-specific: build it on Linux for a Linux archive, on Windows for a
-Windows one (name the output `*.exe`). It takes the same `-t`/`-b`/`-q`
-options as `c`, and running an archive takes `-f`, `-q`, and `-t`. Because it
-embeds the stub, the archive is larger than a plain `.sq` by the size of the
-`squish` binary — worth it for handoff, not for routine storage.
+ratio-optimal single-block layout used for the results table above.
+Decompression uses all cores the archive allows (`-t` caps it). Budget
+~150 MB of model memory per thread.
 
 When stderr is a terminal, a live status line (percent, bytes, throughput)
 is shown while working, followed by a one-line summary. Pass `-q` /
@@ -113,18 +90,24 @@ C (see [examples/example.c](examples/example.c), full reference in
 ```c
 #include <squish.h>
 
+/* Compress a buffer into a one-member archive and back. The trailing args are
+ * threads (0 = all cores, 1 = serial), chunk size (0 = 16 MiB), and an
+ * optional progress callback + user pointer. */
 void  *c, *d;  size_t cn, dn;
-squish_compress_alloc(data, n, &c, &cn);
-squish_decompress_alloc(c, cn, &d, &dn);   /* integrity-checked */
+squish_compress_alloc(data, n, &c, &cn, 1, 0, NULL, NULL);
+squish_decompress_alloc(c, cn, &d, &dn, 0, NULL, NULL);   /* integrity-checked */
 squish_free(c);  squish_free(d);
 ```
 
-Multi-threaded variants take a thread count (0 = all cores) and, for
-compression, a chunk size (0 = 16 MiB default):
+Pack and inspect a directory tree through the `squish_archive_*` API, reaching
+any one member without inflating the rest:
 
 ```c
-squish_compress_alloc_mt(data, n, &c, &cn, 0, 0, NULL, NULL);
-squish_decompress_alloc_mt(c, cn, &d, &dn, 0, NULL, NULL);
+squish_archive_create("project", "project.sqsh", 0, 0, NULL, NULL);
+squish_archive *a;
+squish_archive_open("project.sqsh", &a);
+squish_archive_extract_path(a, "src/main.c", &d, &dn);    /* just this file */
+squish_free(d);  squish_archive_close(a);
 ```
 
 Link with `-lsquish -lm -pthread` (or `pkg-config --cflags --libs squish`
@@ -150,12 +133,13 @@ bench/              benchmark scripts, baselines, RESULTS.md
 
 ## Guarantees and limits
 
-- Round-trip fidelity: every stream carries a 32-bit checksum of the
+- One on-disk format: every output is a SQUISH archive (magic `SQSH`).
+- Round-trip fidelity: every coded block carries a 32-bit checksum of its
   original data; decompression fails loudly on corruption.
-- `squish_compress_bound(n) = n + 17`: incompressible data falls back to
-  stored mode, so output never exceeds input by more than the header.
-- Inputs up to 4 GiB per stream.
+- Bounded expansion: incompressible data falls back to stored blocks, so
+  `squish_compress_bound(n)` is guaranteed to hold the result.
+- Up to 4 GiB per member.
 - No global mutable state: concurrent (de)compressions on different buffers
   from multiple threads are safe.
 - The model is the format: the constants in `squish.c` define the bitstream.
-  Any change to them is a format break and needs a new magic number.
+  Any change to them is a format break and needs a new version.

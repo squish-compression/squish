@@ -71,8 +71,7 @@ squish.exe: squish_cli.c libsquish-win.a
 # rules above. Producing the same output filenames from either toolchain is
 # intentional — pick whichever is available on the host.
 # squish.exe links the library statically (compiling squish.c into it, like the
-# mingw rule above) so it stands alone — required for `squish s` archives, which
-# copy the CLI as their stub and must run without squish.dll present.
+# mingw rule above) so it stands alone and runs without squish.dll present.
 windows-dll:
 	$(CL) $(CLFLAGS) /LD /DSQUISH_BUILD_DLL /Fe:squish.dll squish.c
 	$(CL) $(CLFLAGS) /Fe:squish.exe squish_cli.c squish.c

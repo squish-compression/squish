@@ -7,15 +7,22 @@ the static library).
 
 ## Model of operation
 
-libsquish is a **one-shot, whole-buffer** codec. The algorithm's match model
-addresses the entire history, so streaming chunks independently would cost
-ratio; hand the library complete buffers (or use the file helpers). Memory
-per call is ~150 MB of model state plus your buffers, released before the
-call returns.
+libsquish has **one on-disk format, the SQUISH archive**. A buffer or a single
+file becomes a one-member archive; a directory tree becomes a many-member
+archive. Inside, a member's bytes are one or more independently-coded *blocks*
+(each up to `chunk_size`), which is what lets big members (de)compress in
+parallel and lets a reader seek to any member. The full byte layout is in
+[FORMAT.md](FORMAT.md).
+
+The algorithm's match model addresses the whole of a block, so the ratio is
+best when a member is one block; splitting into blocks trades roughly 1–2% of
+ratio (at the 16 MiB default) for parallelism. Memory per active block is
+~150 MB of model state plus your buffers, released as blocks finish.
 
 **Thread safety:** the library has no global mutable state. Any number of
 threads may compress/decompress concurrently as long as they don't share
-buffers. A single call is single-threaded and CPU-bound (~0.5–0.7 MB/s).
+buffers. Pass `nthreads` to parallelize *within* one call; an archive reader
+handle, by contrast, is not thread-safe — use one per thread or serialize.
 
 **Status codes:** every function returns `int`; `SQUISH_OK` (0) on success,
 negative `squish_status` otherwise. `squish_strerror` renders any code.
@@ -25,174 +32,104 @@ negative `squish_status` otherwise. `squish_strerror` renders any code.
 | `SQUISH_OK` (0) | success |
 | `SQUISH_E_PARAM` (-1) | NULL pointer or invalid argument |
 | `SQUISH_E_NOMEM` (-2) | allocation failure |
-| `SQUISH_E_FORMAT` (-3) | bad magic, bad mode byte, size field, or truncation |
+| `SQUISH_E_FORMAT` (-3) | bad magic/header, corrupt archive, or truncation |
 | `SQUISH_E_DSTSIZE` (-4) | destination capacity insufficient |
-| `SQUISH_E_TOOBIG` (-5) | input ≥ `SQUISH_MAX_INPUT` (4 GiB − 16) |
+| `SQUISH_E_TOOBIG` (-5) | a member ≥ `SQUISH_MAX_INPUT` (4 GiB − 16) |
 | `SQUISH_E_IO` (-6) | file open/read/write failed (file helpers only) |
-| `SQUISH_E_CHECKSUM` (-7) | payload decoded but integrity check failed |
+| `SQUISH_E_CHECKSUM` (-7) | a block decoded but its integrity check failed |
 
 ---
 
 ## Introspection
 
 ```c
-const char *squish_version(void);
+const char *squish_version(void);      /* "1.0.0" */
+const char *squish_strerror(int code); /* human-readable, static, never NULL */
+int         squish_threads(void);      /* processors online; what nthreads=0 picks */
 ```
-Returns the library version string (`"1.0.0"`). Compare against
-`SQUISH_VERSION_MAJOR/MINOR/PATCH` from the header you compiled with.
 
-```c
-const char *squish_strerror(int code);
-```
-Human-readable description of any status code. Static storage; never NULL.
-
-## Sizing
-
-```c
-size_t squish_compress_bound(size_t src_len);
-```
-Worst-case compressed size: `src_len + 17` (13-byte header + 4-byte
-checksum). This is a hard guarantee — when the coded stream would exceed the
-stored size, compression falls back to stored mode — so a destination of
-this capacity can never yield `SQUISH_E_DSTSIZE`.
-
-```c
-int squish_decompressed_size(const void *src, size_t src_len,
-                             uint64_t *out_size);
-```
-Reads the original size from a compressed header. Needs only the first
-12 bytes; does not validate the payload. Use it to size destination buffers.
-
-## One-shot, caller-provided buffers
-
-```c
-int squish_compress(const void *src, size_t src_len,
-                    void *dst, size_t *dst_len);
-```
-Compresses `src[0..src_len)` into `dst`. On entry `*dst_len` is the capacity
-of `dst`; on success it becomes the number of bytes written. `src` is only
-read. `src` and `dst` must not overlap. Fails with `SQUISH_E_DSTSIZE` if
-capacity is insufficient (never happens at `squish_compress_bound(src_len)`
-capacity), `SQUISH_E_TOOBIG` beyond 4 GiB, `SQUISH_E_NOMEM` if the ~150 MB
-of model state can't be allocated.
-
-```c
-int squish_decompress(const void *src, size_t src_len,
-                      void *dst, size_t *dst_len);
-```
-Decompresses and **verifies the checksum**. On entry `*dst_len` is the
-capacity of `dst`; on success it becomes the decompressed size. If capacity
-is too small, returns `SQUISH_E_DSTSIZE` and sets `*dst_len` to the required
-size without touching `dst`. `SQUISH_E_CHECKSUM` means the container parsed
-but the reconstructed data does not match what was compressed — treat the
-output as garbage. Corrupt or truncated input never crashes; it produces an
-error code.
-
-## One-shot, library-allocated output
-
-```c
-int squish_compress_alloc(const void *src, size_t src_len,
-                          void **dst, size_t *dst_len);
-int squish_decompress_alloc(const void *src, size_t src_len,
-                            void **dst, size_t *dst_len);
-void squish_free(void *p);
-```
-Same semantics, but the library allocates `*dst` (trimmed to the exact
-result size). On any error `*dst` is NULL. Release with `squish_free` — not
-plain `free` — so the allocator always matches across DLL boundaries on
-Windows.
-
-## File helpers
-
-```c
-int squish_compress_file(const char *src_path, const char *dst_path);
-int squish_decompress_file(const char *src_path, const char *dst_path);
-```
-Whole-file convenience wrappers (read fully into memory, process, write;
-`dst_path` is overwritten). All buffer-level errors pass through;
-`SQUISH_E_IO` covers filesystem trouble.
+## Progress reporting
 
 ```c
 typedef void (*squish_progress_fn)(uint64_t processed, uint64_t total,
                                    void *user);
+```
+`progress` (wherever accepted; may be NULL) is invoked with the count of
+original — uncompressed — bytes handled so far, periodically and once with
+`processed == total` on completion. It is called from the coding loop, so keep
+it cheap and do not call back into the library. Under multiple threads calls
+are serialized by the library but may arrive on worker threads; `processed`
+stays monotonic across the whole member.
 
-int squish_compress_file2(const char *src_path, const char *dst_path,
+## In-memory: buffer ⇄ one-member archive
+
+```c
+size_t squish_compress_bound(size_t src_len);
+```
+Worst-case archive size for `src_len` input bytes — a hard guarantee: a buffer
+of at least this capacity can always hold the result, because incompressible
+data falls back to stored blocks.
+
+```c
+int squish_compress_alloc(const void *src, size_t src_len,
+                          void **dst, size_t *dst_len,
+                          int nthreads, size_t chunk_size,
                           squish_progress_fn progress, void *user);
-int squish_decompress_file2(const char *src_path, const char *dst_path,
-                            squish_progress_fn progress, void *user);
 ```
-As above, plus progress reporting: `progress` (if non-NULL) is invoked with
-the count of original — uncompressed — bytes processed so far, every 64 KiB
-of progress and once with `processed == total` on completion. It is called
-from the coding loop, so keep it cheap and do not call back into the
-library. `user` is passed through untouched. With `progress == NULL` these
-are identical to the plain versions.
-
-## Multi-threaded variants
+Compresses `src[0..src_len)` into a freshly allocated archive holding a single
+unnamed member. `nthreads` (`0` = all cores, `1` = serial) and `chunk_size`
+(`0` = `SQUISH_DEFAULT_CHUNK`, 16 MiB; raised to `SQUISH_MIN_CHUNK`, 64 KiB, if
+smaller) shape the member's blocks. **The bytes produced depend only on
+`chunk_size`, never on `nthreads`.** On any error `*dst` is NULL. Free with
+`squish_free`.
 
 ```c
-int squish_threads(void);
+int squish_decompress_alloc(const void *src, size_t src_len,
+                            void **dst, size_t *dst_len,
+                            int nthreads, squish_progress_fn progress, void *user);
 ```
-Number of processors online (>= 1); what `nthreads = 0` selects below.
+Restores the single member of the archive into a freshly allocated buffer,
+verifying every block's checksum. Rejects an archive that does not hold exactly
+one file member with `SQUISH_E_FORMAT` (use the `squish_archive_*` API for
+multi-member archives). `SQUISH_E_CHECKSUM` means a block decoded but the data
+does not match what was compressed — treat the output as garbage. Corrupt or
+truncated input never crashes; it returns an error.
 
 ```c
-int squish_compress_mt(const void *src, size_t src_len,
-                       void *dst, size_t *dst_len,
-                       int nthreads, size_t chunk_size,
-                       squish_progress_fn progress, void *user);
-int squish_decompress_mt(const void *src, size_t src_len,
-                         void *dst, size_t *dst_len, int nthreads,
+int  squish_content_size(const void *src, size_t src_len, uint64_t *out_size);
+void squish_free(void *p);
+```
+`content_size` reads the archive's total uncompressed size from the header
+(needs 32 bytes; no decompression). Release any `*_alloc`/`*_extract` buffer
+with `squish_free` — not plain `free` — so the allocator matches across DLL
+boundaries on Windows.
+
+## File helpers
+
+```c
+int squish_compress_file(const char *src_path, const char *dst_path,
+                         int nthreads, size_t chunk_size,
                          squish_progress_fn progress, void *user);
-
-int squish_compress_alloc_mt(const void *src, size_t src_len,
-                             void **dst, size_t *dst_len,
-                             int nthreads, size_t chunk_size,
-                             squish_progress_fn progress, void *user);
-int squish_decompress_alloc_mt(const void *src, size_t src_len,
-                               void **dst, size_t *dst_len, int nthreads,
-                               squish_progress_fn progress, void *user);
-
-int squish_compress_file_mt(const char *src_path, const char *dst_path,
-                            int nthreads, size_t chunk_size,
-                            squish_progress_fn progress, void *user);
-int squish_decompress_file_mt(const char *src_path, const char *dst_path,
-                              int nthreads,
-                              squish_progress_fn progress, void *user);
+int squish_decompress_file(const char *src_path, const char *dst_path,
+                           int nthreads, squish_progress_fn progress, void *user);
 ```
-
-Parallel counterparts of the functions above, with the same buffer,
-allocation, file, and progress contracts. Compression splits the input
-into `chunk_size`-byte chunks (`0` = `SQUISH_DEFAULT_CHUNK`, 16 MiB;
-minimum `SQUISH_MIN_CHUNK`, 64 KiB) and codes each independently on a pool
-of `nthreads` workers (`0` = all cores), emitting a multi-block `SQ01`
-stream — see [FORMAT.md](FORMAT.md) §1b. Points worth knowing:
-
-- **Output is deterministic**: it depends on the input and `chunk_size`
-  only, never on `nthreads`.
-- **Ratio cost**: each chunk's model starts cold, costing roughly 1–2% at
-  the 16 MiB default (more at smaller chunks). Inputs no larger than one
-  chunk produce a plain `SQ02` stream, bit-identical to `squish_compress`.
-- **Bound preserved**: `squish_compress_bound` still holds — inputs that
-  don't benefit fall back to a single stored-mode `SQ02` stream.
-- The decompression functions read both formats; parallelism applies to
-  `SQ01` streams (`SQ02` has a single sequential model). The plain
-  (non-`_mt`) decompression functions also accept `SQ01`, serially.
-- **Memory**: ~150 MB of model state per active worker.
-- `progress` calls are serialized by the library but may arrive on worker
-  threads; `processed` stays monotonic across the whole input.
+`compress_file` packs one file into a one-member archive at `dst_path` (the
+member takes the source's basename, and the archive's `SINGLE` flag is set).
+`decompress_file` restores a one-member archive to `dst_path`, rejecting a
+multi-member archive with `SQUISH_E_FORMAT` (extract those with the archive
+API). `nthreads`/`chunk_size`/`progress` behave as above; `SQUISH_E_IO` covers
+filesystem trouble.
 
 ---
 
 ## Archives
 
-A directory tree can be packed into a **seekable SQAR archive**: a header, one
-independently-compressed stream per file, and a compressed index of paths and
-per-file offsets. A reader inflates the small index at open time, then reaches
-any single member by seeking to its stream — the rest of the archive is never
-touched. The price of that random access is that each file's model starts cold,
-so many tiny files compress a little worse than one solid stream would. The
-container is specified byte-for-byte in [FORMAT.md](FORMAT.md) §12; it is **not**
-a `squish_decompress` stream, so use the `squish_archive_*` functions below.
+A directory tree is packed into a **seekable archive**: a header, one
+independently-compressed member per file, and a compressed index of paths and
+per-file block layout. A reader inflates the small index at open time, then
+reaches any single member by seeking to its blocks — the rest of the archive is
+never touched. The container is specified byte-for-byte in
+[FORMAT.md](FORMAT.md) §1.
 
 ```c
 int squish_archive_create(const char *dir_path, const char *archive_path,
@@ -200,12 +137,12 @@ int squish_archive_create(const char *dir_path, const char *archive_path,
                           squish_progress_fn cb, void *user);
 ```
 Walks `dir_path` and writes a seekable archive to `archive_path`, compressing
-each file as its own stream. `nthreads`/`chunk_size` behave as in the `_mt`
-functions (a file larger than one chunk becomes a parallel `SQ01` stream);
-`cb` reports total uncompressed bytes packed. Directories (including empty
-ones) and unix mode bits are recorded; sockets, fifos, and dangling links are
-skipped. Members are stored pre-order, siblings sorted, so the archive depends
-only on the tree — not on directory iteration order.
+each file as its own member. `nthreads`/`chunk_size` behave as above (a file
+larger than one chunk is split into parallel blocks); `cb` reports total
+uncompressed bytes packed. Directories (including empty ones) and unix mode
+bits are recorded; sockets, fifos, and dangling links are skipped. Members are
+stored pre-order, siblings sorted, so the archive depends only on the tree —
+not on directory iteration order.
 
 ```c
 int  squish_archive_probe(const void *data, size_t len);   /* needs 12 bytes */
@@ -217,8 +154,8 @@ void squish_archive_close(squish_archive *a);
 proportional to the member count, not the archive size — keeping the file open
 to seek per extraction. `open_memory` borrows a buffer that must outlive the
 handle (it must not be freed until `close`). `probe` is a cheap sniff for
-telling an archive from a plain stream. A handle is not thread-safe; use one
-per thread, or serialize calls.
+telling an archive from other data. A handle is not thread-safe; use one per
+thread, or serialize calls.
 
 ```c
 int      squish_archive_info_get(const squish_archive *a, squish_archive_info *out);
@@ -229,11 +166,12 @@ int      squish_archive_find(const squish_archive *a, const char *path,
                              uint64_t *index_out);
 ```
 Header and listing, all served from the in-memory index with no decompression.
-`info` exposes `version`, `flags`, `entry_count`, and `total_size` (the summed
-uncompressed size). `stat` fills a `squish_archive_entry` (`path`,
+`info` exposes `version`, `flags` (bit 0 = `SINGLE`), `entry_count`,
+`total_size`, and `chunk_size`. `stat` fills a `squish_archive_entry` (`path`,
 `size`, `stored_size`, `mode`, `is_dir`); its `path` points into the handle and
-is valid until `close`. `find` returns `SQUISH_E_FORMAT` when the path is not a
-member (a trailing `/` on the query is ignored).
+is valid until `close` (it is `""` for the unnamed member of a blob archive).
+`find` returns `SQUISH_E_FORMAT` when the path is not a member (a trailing `/`
+on the query is ignored).
 
 ```c
 int squish_archive_extract(squish_archive *a, uint64_t index,
@@ -242,8 +180,8 @@ int squish_archive_extract_path(squish_archive *a, const char *path,
                                 void **out, size_t *out_len);
 ```
 Inflate **one** member into a library-allocated buffer (free with
-`squish_free`), reading and decoding only that member's stream and verifying
-its checksum. A directory member returns `SQUISH_E_PARAM`.
+`squish_free`), reading and decoding only that member's blocks and verifying
+their checksums. A directory member returns `SQUISH_E_PARAM`.
 
 ```c
 int squish_archive_extract_to_file(squish_archive *a, const char *path,
@@ -261,9 +199,9 @@ against traversal on the way out, so an archive can never write outside
 `dst_root`.
 
 ```c
-/* list every member, then pull one file out — reading only its stream */
+/* list every member, then pull one file out — reading only its blocks */
 squish_archive *a;
-if (squish_archive_open("photos.sqar", &a) == SQUISH_OK) {
+if (squish_archive_open("photos.sqsh", &a) == SQUISH_OK) {
     uint64_t n = squish_archive_count(a);
     for (uint64_t i = 0; i < n; i++) {
         squish_archive_entry e;
@@ -296,13 +234,13 @@ x86_64-w64-mingw32-gcc app.c -DSQUISH_DLL -lsquish -L/path/to/import/lib
 ```
 
 From Python, load `libsquish.so` with `ctypes` directly —
-`examples/example.py` is a complete, copyable wrapper (~40 lines).
+`examples/example.py` is a complete, copyable wrapper.
 
 ## ABI and format stability
 
 - The shared library uses semantic versioning; soname `libsquish.so.1`.
   Functions are added, never changed, within a major version.
-- The bitstream format is identified by the magic (`SQ02` single stream,
-  `SQ01` multi-block). The model constants in `squish.c` **are** the
-  format: streams are only decodable by a build with identical constants.
-  Readers reject other magics with `SQUISH_E_FORMAT`.
+- There is one on-disk format, identified by the magic `SQSH` and a version
+  field. The model constants in `squish.c` **are** the format: archives are
+  only decodable by a build with identical constants. Readers reject other
+  magics or versions with `SQUISH_E_FORMAT`.

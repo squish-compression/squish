@@ -39,7 +39,9 @@ SQUISH beats zip+bzip2+rar on 23/24 files; beats all four (incl. xz -9e) on 19/2
 
 ### SQUISH compression modes
 
-Same corpus, three ways to run SQUISH. `single` is the ratio-optimal single-block stream; `mt` splits into blocks across all cores (a little ratio for a lot of speed); `sfx` is a standalone self-extracting executable — its size includes the ~212 KB extractor stub, and its round-trip is the stub actually running.
+Same corpus, two ways to run SQUISH. `single` is the ratio-optimal single-block layout; `mt` splits each member into blocks across all cores (a little ratio for a lot of speed). Both write a one-member SQUISH archive.
+
+> Note: the `sfx` column below is retained from a run predating the single-format consolidation; the self-extracting archive has since been removed, and re-running `bench/run_squish.py` + `bench/report.py` will drop that column. The `single`/`mt` figures are unaffected — the codec is byte-for-byte identical, and the archive adds only a small fixed header + index per file.
 
 | file | orig | single | c/d s | mt | c/d s | mt Δsize | mt speedup | sfx (with stub) | extract s |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|

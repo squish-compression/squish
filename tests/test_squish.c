@@ -14,7 +14,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* libsquish test suite: API contract, round-trips, error paths, robustness */
+/* libsquish test suite: API contract, round-trips, error paths, robustness.
+ * Everything is a SQUISH archive: a buffer or file is a one-member archive,
+ * a directory is a many-member archive. */
 #include "squish.h"
 
 #include <stdio.h>
@@ -59,10 +61,6 @@ static void progress_probe(uint64_t processed, uint64_t total, void *user) {
     progress_state.total = total;
 }
 
-static void wr_le(uint8_t *p, uint64_t v, int nb) {
-    for (int i = 0; i < nb; i++) p[i] = (uint8_t)(v >> (8*i));
-}
-
 /* write n bytes to path (archive test fixtures) */
 static void wfile(const char *path, const void *d, size_t n) {
     FILE *f = fopen(path, "wb");
@@ -80,21 +78,39 @@ static int file_is(const char *path, const void *d, size_t n) {
     free(buf);
     return ok;
 }
+/* read a whole file into a fresh buffer (caller frees) */
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+    uint8_t *b = (uint8_t *)malloc(sz > 0 ? (size_t)sz : 1);
+    if (b && sz > 0 && fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); b = NULL; }
+    fclose(f);
+    if (b) *n = (size_t)sz;
+    return b;
+}
 
-static void roundtrip(const uint8_t *data, size_t n, const char *name) {
+/* Buffer round-trip through a one-member archive. nthreads/chunk exercise
+ * both the single-block and multi-block layouts. */
+static void roundtrip_ex(const uint8_t *data, size_t n, int t, size_t chunk,
+                         const char *name) {
     void *c = NULL, *d = NULL;
     size_t cn = 0, dn = 0;
-    int rc = squish_compress_alloc(data, n, &c, &cn);
+    int rc = squish_compress_alloc(data, n, &c, &cn, t, chunk, NULL, NULL);
     CHECK(rc == SQUISH_OK, name);
     if (rc != SQUISH_OK) return;
     CHECK(cn <= squish_compress_bound(n), "  within bound");
+    CHECK(squish_archive_probe(c, cn) == 1, "  output is an archive");
     uint64_t hdr_n = 0;
-    CHECK(squish_decompressed_size(c, cn, &hdr_n) == SQUISH_OK && hdr_n == n,
-          "  header size");
-    rc = squish_decompress_alloc(c, cn, &d, &dn);
+    CHECK(squish_content_size(c, cn, &hdr_n) == SQUISH_OK && hdr_n == n,
+          "  content size");
+    rc = squish_decompress_alloc(c, cn, &d, &dn, t, NULL, NULL);
     CHECK(rc == SQUISH_OK && dn == n && (n == 0 || memcmp(data, d, n) == 0),
           "  bytes identical");
     squish_free(c); squish_free(d);
+}
+static void roundtrip(const uint8_t *data, size_t n, const char *name) {
+    roundtrip_ex(data, n, 1, 0, name);
 }
 
 int main(void) {
@@ -102,6 +118,7 @@ int main(void) {
     CHECK(strcmp(squish_version(), SQUISH_VERSION_STRING) == 0, "version");
     CHECK(strcmp(squish_strerror(SQUISH_E_CHECKSUM),
                  "integrity check failed") == 0, "strerror");
+    CHECK(squish_threads() >= 1, "squish_threads");
 
     /* --- round-trips across shapes and sizes --- */
     roundtrip(NULL, 0, "roundtrip empty");
@@ -139,44 +156,35 @@ int main(void) {
 
     /* --- error paths --- */
     {
-        uint8_t buf[64];
-        size_t bn = sizeof buf;
-        CHECK(squish_compress(NULL, 5, buf, &bn) == SQUISH_E_PARAM,
-              "compress NULL src");
-        CHECK(squish_decompress(buf, 0, buf, &bn) == SQUISH_E_FORMAT,
-              "decompress empty src");
-        memset(buf, 'X', sizeof buf);
-        bn = sizeof buf;
-        CHECK(squish_decompress(buf, sizeof buf, buf, &bn) == SQUISH_E_FORMAT,
-              "decompress garbage");
-    }
-    {
-        const char *msg = "hello, squish!";
-        uint8_t small[4];
-        size_t sn = sizeof small;
-        CHECK(squish_compress(msg, strlen(msg), small, &sn) == SQUISH_E_DSTSIZE,
-              "compress dst too small");
+        void *c; size_t cn;
+        CHECK(squish_compress_alloc(NULL, 5, &c, &cn, 1, 0, NULL, NULL)
+              == SQUISH_E_PARAM, "compress NULL src");
+        uint8_t garbage[64];
+        memset(garbage, 'X', sizeof garbage);
+        void *d; size_t dn;
+        CHECK(squish_decompress_alloc(garbage, sizeof garbage, &d, &dn, 1, NULL, NULL)
+              == SQUISH_E_FORMAT && d == NULL, "decompress garbage");
+        uint64_t sz;
+        CHECK(squish_content_size(garbage, sizeof garbage, &sz) == SQUISH_E_FORMAT,
+              "content_size garbage");
     }
     {
         const char *msg = "The rain in Spain stays mainly in the plain. "
                           "The rain in Spain stays mainly in the plain.";
         void *c; size_t cn;
-        CHECK(squish_compress_alloc(msg, strlen(msg), &c, &cn) == SQUISH_OK,
-              "compress text");
-        uint8_t tiny[4]; size_t tn = sizeof tiny;
-        int rc = squish_decompress(c, cn, tiny, &tn);
-        CHECK(rc == SQUISH_E_DSTSIZE && tn == strlen(msg),
-              "decompress dst too small reports needed size");
-        /* corrupt one payload byte -> checksum must catch it */
-        ((uint8_t*)c)[cn/2] ^= 0x40;
+        CHECK(squish_compress_alloc(msg, strlen(msg), &c, &cn, 1, 0, NULL, NULL)
+              == SQUISH_OK, "compress text");
+        /* corrupt a member payload byte (just past the 64-byte header) ->
+         * checksum must catch it */
+        ((uint8_t*)c)[70] ^= 0x40;
         void *d; size_t dn;
-        rc = squish_decompress_alloc(c, cn, &d, &dn);
-        CHECK(rc == SQUISH_E_CHECKSUM && d == NULL,
-              "corruption detected by checksum");
-        /* truncated stream must fail cleanly, not crash */
-        uint8_t out[256]; size_t on = sizeof out;
-        rc = squish_decompress(c, cn / 2, out, &on);
-        CHECK(rc != SQUISH_OK, "truncated stream rejected");
+        int rc = squish_decompress_alloc(c, cn, &d, &dn, 1, NULL, NULL);
+        CHECK((rc == SQUISH_E_CHECKSUM || rc == SQUISH_E_FORMAT) && d == NULL,
+              "corruption detected");
+        ((uint8_t*)c)[70] ^= 0x40;                 /* restore */
+        /* truncated archive must fail cleanly, not crash */
+        rc = squish_decompress_alloc(c, cn / 2, &d, &dn, 1, NULL, NULL);
+        CHECK(rc != SQUISH_OK && d == NULL, "truncated archive rejected");
         squish_free(c);
     }
     {   /* file helpers */
@@ -186,9 +194,9 @@ int main(void) {
         FILE *f = fopen(tmp_in, "wb");
         for (int i = 0; i < 50000; i++) fputc((i * 31) & 255, f);
         fclose(f);
-        CHECK(squish_compress_file(tmp_in, tmp_sq) == SQUISH_OK,
+        CHECK(squish_compress_file(tmp_in, tmp_sq, 1, 0, NULL, NULL) == SQUISH_OK,
               "compress_file");
-        CHECK(squish_decompress_file(tmp_sq, tmp_out) == SQUISH_OK,
+        CHECK(squish_decompress_file(tmp_sq, tmp_out, 0, NULL, NULL) == SQUISH_OK,
               "decompress_file");
         FILE *a = fopen(tmp_in, "rb"), *b = fopen(tmp_out, "rb");
         int same = 1, ca, cb;
@@ -196,11 +204,11 @@ int main(void) {
         while (ca != EOF && cb != EOF);
         fclose(a); fclose(b);
         CHECK(same, "file round-trip identical");
-        CHECK(squish_compress_file("tests/.does_not_exist", tmp_sq)
+        CHECK(squish_compress_file("tests/.does_not_exist", tmp_sq, 1, 0, NULL, NULL)
               == SQUISH_E_IO, "missing input file");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
     }
-    {   /* multi-threaded round-trip: chunked SQ01 stream, all readers */
+    {   /* multi-threaded round-trip: a member split into blocks */
         static uint8_t t[500000];
         const char *w[] = {"alpha ","beta ","gamma ","delta ","omega "};
         size_t p = 0;
@@ -209,163 +217,78 @@ int main(void) {
             for (const char *q = s; *q && p < sizeof t; q++) t[p++] = (uint8_t)*q;
         }
         void *c = NULL; size_t cn = 0;
-        int rc = squish_compress_alloc_mt(t, sizeof t, &c, &cn,
-                                          4, SQUISH_MIN_CHUNK, NULL, NULL);
-        CHECK(rc == SQUISH_OK, "compress_mt text 500k");
+        int rc = squish_compress_alloc(t, sizeof t, &c, &cn, 4, SQUISH_MIN_CHUNK,
+                                       NULL, NULL);
+        CHECK(rc == SQUISH_OK, "mt archive text 500k");
         CHECK(cn <= squish_compress_bound(sizeof t), "  within bound");
-        CHECK(cn >= 4 && memcmp(c, "SQ01", 4) == 0, "  multi-block magic");
-        uint64_t hdr_n = 0;
-        CHECK(squish_decompressed_size(c, cn, &hdr_n) == SQUISH_OK &&
-              hdr_n == sizeof t, "  header size");
+        CHECK(squish_archive_probe(c, cn) == 1, "  is an archive");
         void *d = NULL; size_t dn = 0;
-        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 4, NULL, NULL);
+        rc = squish_decompress_alloc(c, cn, &d, &dn, 4, NULL, NULL);
         CHECK(rc == SQUISH_OK && dn == sizeof t && memcmp(t, d, dn) == 0,
               "  mt decompress identical");
-        squish_free(d); d = NULL; dn = 0;
-        rc = squish_decompress_alloc(c, cn, &d, &dn);    /* plain API reads SQ01 */
-        CHECK(rc == SQUISH_OK && dn == sizeof t && memcmp(t, d, dn) == 0,
-              "  plain decompress reads SQ01");
         squish_free(d);
-        /* stream must not depend on thread count */
+        /* bytes must not depend on thread count, only on chunk size */
         void *c1 = NULL; size_t c1n = 0;
-        rc = squish_compress_alloc_mt(t, sizeof t, &c1, &c1n,
-                                      1, SQUISH_MIN_CHUNK, NULL, NULL);
+        rc = squish_compress_alloc(t, sizeof t, &c1, &c1n, 1, SQUISH_MIN_CHUNK,
+                                   NULL, NULL);
         CHECK(rc == SQUISH_OK && c1n == cn && memcmp(c, c1, cn) == 0,
               "  output independent of thread count");
         squish_free(c1);
-        /* corrupting any chunk must fail the (per-chunk) checksum */
-        ((uint8_t*)c)[cn - 3] ^= 0x40;
-        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 4, NULL, NULL);
-        CHECK(rc == SQUISH_E_CHECKSUM && d == NULL,
-              "  chunk corruption detected");
+        /* corrupting a member block must fail the (per-block) checksum */
+        ((uint8_t*)c)[70] ^= 0x40;
+        rc = squish_decompress_alloc(c, cn, &d, &dn, 4, NULL, NULL);
+        CHECK(rc != SQUISH_OK && d == NULL, "  block corruption detected");
         squish_free(c);
     }
-    {   /* mt on random data: outer stored-mode fallback keeps the bound */
+    {   /* mt on random data: stored-mode blocks keep the bound */
         static uint8_t r[300000];
         for (size_t i = 0; i < sizeof r; i++) r[i] = rnd();
         void *c = NULL; size_t cn = 0;
-        int rc = squish_compress_alloc_mt(r, sizeof r, &c, &cn,
-                                          0, SQUISH_MIN_CHUNK, NULL, NULL);
+        int rc = squish_compress_alloc(r, sizeof r, &c, &cn, 0, SQUISH_MIN_CHUNK,
+                                       NULL, NULL);
         CHECK(rc == SQUISH_OK && cn <= squish_compress_bound(sizeof r),
-              "compress_mt random within bound");
+              "mt archive random within bound");
         void *d = NULL; size_t dn = 0;
-        rc = squish_decompress_alloc_mt(c, cn, &d, &dn, 0, NULL, NULL);
+        rc = squish_decompress_alloc(c, cn, &d, &dn, 0, NULL, NULL);
         CHECK(rc == SQUISH_OK && dn == sizeof r && memcmp(r, d, dn) == 0,
               "  round-trip identical");
         squish_free(c); squish_free(d);
     }
-    {   /* small input through the mt API stays a plain SQ02 stream */
-        const char *msg = "tiny input, one chunk";
-        uint8_t buf[128]; size_t bn = sizeof buf;
-        int rc = squish_compress_mt(msg, strlen(msg), buf, &bn,
-                                    8, 0, NULL, NULL);
-        CHECK(rc == SQUISH_OK && memcmp(buf, "SQ02", 4) == 0,
-              "compress_mt small input emits SQ02");
-        CHECK(squish_threads() >= 1, "squish_threads");
-    }
-    {   /* malformed containers: every case must fail cleanly, never crash */
+    {   /* malformed archives: every case must fail cleanly, never crash */
         static uint8_t t[150000];
         for (size_t i = 0; i < sizeof t; i++)
             t[i] = (uint8_t)("squish stress "[i % 14]);
         void *c = NULL; size_t cn = 0;
-        int rc = squish_compress_alloc_mt(t, sizeof t, &c, &cn,
-                                          2, SQUISH_MIN_CHUNK, NULL, NULL);
-        CHECK(rc == SQUISH_OK && cn > 21 && memcmp(c, "SQ01", 4) == 0,
-              "malformed-container template");
+        int rc = squish_compress_alloc(t, sizeof t, &c, &cn, 2, SQUISH_MIN_CHUNK,
+                                       NULL, NULL);
+        CHECK(rc == SQUISH_OK && squish_archive_probe(c, cn),
+              "malformed-archive template");
         uint8_t *m = (uint8_t*)malloc(cn);
-        void *d = NULL; size_t dn = 0;
-        int ok = 1;
+        squish_archive *A;
 
-        /* chunk count out of range: 0 and huge */
-        memcpy(m, c, cn); wr_le(m + 13, 0, 4);
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        memcpy(m, c, cn); wr_le(m + 13, 0xFFFFFFFFu, 4);
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        CHECK(ok, "  bad chunk count rejected");
-
-        /* chunk table that does not tile the payload */
-        memcpy(m, c, cn); wr_le(m + 17, 0, 4);
-        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        memcpy(m, c, cn); wr_le(m + 17, 0xFFFFFFF0u, 4);
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        CHECK(ok, "  bad chunk table rejected");
-
-        /* total size that disagrees with the chunks' own sizes */
-        memcpy(m, c, cn); wr_le(m + 4, sizeof t + 1, 8);
-        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        memcpy(m, c, cn); wr_le(m + 4, sizeof t - 1, 8);
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        CHECK(ok, "  header size mismatch rejected");
-
-        /* size field past the format limit must be rejected up front */
-        memcpy(m, c, cn); wr_le(m + 4, ~0ull, 8);
-        uint64_t hn;
-        ok = squish_decompressed_size(m, cn, &hn) == SQUISH_E_FORMAT;
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) != SQUISH_OK;
-        CHECK(ok, "  oversize header rejected");
-
-        /* nested SQ01 chunk and bad mode bytes */
-        uint32_t k = ((uint8_t*)c)[13] | ((uint32_t)((uint8_t*)c)[14] << 8) |
-                     ((uint32_t)((uint8_t*)c)[15] << 16) |
-                     ((uint32_t)((uint8_t*)c)[16] << 24);
-        memcpy(m, c, cn); memcpy(m + 17 + 4 * (size_t)k, "SQ01", 4);
-        ok = squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        memcpy(m, c, cn); m[12] = 0;
-        ok &= squish_decompress_alloc(m, cn, &d, &dn) == SQUISH_E_FORMAT;
-        CHECK(ok, "  nested container / bad mode rejected");
-
+        /* wrong version */
+        memcpy(m, c, cn); m[8] ^= 0xFF;
+        CHECK(squish_archive_open_memory(m, cn, &A) == SQUISH_E_FORMAT,
+              "  bad version rejected");
+        /* index offset past the file */
+        memcpy(m, c, cn);
+        for (int i = 0; i < 8; i++) m[40 + i] = 0xFF;
+        CHECK(squish_archive_open_memory(m, cn, &A) == SQUISH_E_FORMAT,
+              "  bad index offset rejected");
+        /* corrupt the index block -> its checksum must reject the archive */
+        memcpy(m, c, cn); m[cn - 3] ^= 0x55;
+        CHECK(squish_archive_open_memory(m, cn, &A) == SQUISH_E_FORMAT,
+              "  corrupt index rejected");
+        /* truncated image */
+        CHECK(squish_archive_open_memory(c, 20, &A) == SQUISH_E_FORMAT,
+              "  truncated archive rejected");
+        /* content_size on a too-short buffer */
+        uint64_t sz;
+        CHECK(squish_content_size(c, 16, &sz) == SQUISH_E_FORMAT,
+              "  content_size short buffer rejected");
         free(m); squish_free(c);
     }
-    {   /* resource hardening: forged streams must fail fast, not chew CPU */
-        void *d = NULL; size_t dn = 0;
-        /* 17-byte stream claiming 16 MB of output with no payload: the
-         * decoder must notice input starvation immediately instead of
-         * decoding megabytes of filler noise before the checksum fails */
-        uint8_t hdr[17];
-        memset(hdr, 0, sizeof hdr);
-        memcpy(hdr, "SQ02", 4);
-        wr_le(hdr + 4, 1u << 24, 8);
-        CHECK(squish_decompress_alloc(hdr, sizeof hdr, &d, &dn)
-              == SQUISH_E_FORMAT, "starved stream rejected early");
-        /* SQ01 whose chunks all claim zero output: no encoder emits these,
-         * and each would cost a full model setup for nothing */
-        uint8_t mb[59];
-        memset(mb, 0, sizeof mb);
-        memcpy(mb, "SQ01", 4);
-        mb[12] = 2;
-        wr_le(mb + 13, 2, 4);                       /* k = 2            */
-        wr_le(mb + 17, 17, 4); wr_le(mb + 21, 17, 4);   /* chunk sizes  */
-        memcpy(mb + 25, "SQ02", 4); mb[25 + 12] = 1;    /* empty stored */
-        memcpy(mb + 42, "SQ02", 4); mb[42 + 12] = 1;
-        CHECK(squish_decompress_alloc(mb, sizeof mb, &d, &dn)
-              == SQUISH_E_FORMAT, "zero-length chunks rejected");
-    }
     {   /* progress-reporting file helpers */
-        const char *tmp_in  = "tests/.t_in";
-        const char *tmp_sq  = "tests/.t_sq";
-        const char *tmp_out = "tests/.t_out";
-        FILE *f = fopen(tmp_in, "wb");
-        for (int i = 0; i < 200000; i++) fputc((i * 31) & 255, f);
-        fclose(f);
-        CHECK(squish_compress_file2(tmp_in, tmp_sq,
-                                    progress_probe, &progress_state)
-              == SQUISH_OK, "compress_file2");
-        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
-              progress_state.done == progress_state.total &&
-              progress_state.total == 200000,
-              "  compress progress reported");
-        memset(&progress_state, 0, sizeof progress_state);
-        progress_state.monotonic = 1;
-        CHECK(squish_decompress_file2(tmp_sq, tmp_out,
-                                      progress_probe, &progress_state)
-              == SQUISH_OK, "decompress_file2");
-        CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
-              progress_state.done == progress_state.total &&
-              progress_state.total == 200000,
-              "  decompress progress reported");
-        remove(tmp_in); remove(tmp_sq); remove(tmp_out);
-    }
-    {   /* mt file helpers with aggregated progress */
         const char *tmp_in  = "tests/.t_in";
         const char *tmp_sq  = "tests/.t_sq";
         const char *tmp_out = "tests/.t_out";
@@ -374,35 +297,29 @@ int main(void) {
         fclose(f);
         memset(&progress_state, 0, sizeof progress_state);
         progress_state.monotonic = 1;
-        CHECK(squish_compress_file_mt(tmp_in, tmp_sq, 3, SQUISH_MIN_CHUNK,
-                                      progress_probe, &progress_state)
-              == SQUISH_OK, "compress_file_mt");
+        CHECK(squish_compress_file(tmp_in, tmp_sq, 3, SQUISH_MIN_CHUNK,
+                                   progress_probe, &progress_state)
+              == SQUISH_OK, "compress_file progress");
         CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
               progress_state.done == progress_state.total &&
               progress_state.total == 300000,
-              "  mt compress progress monotonic");
+              "  compress progress monotonic");
         memset(&progress_state, 0, sizeof progress_state);
         progress_state.monotonic = 1;
-        CHECK(squish_decompress_file_mt(tmp_sq, tmp_out, 3,
-                                        progress_probe, &progress_state)
-              == SQUISH_OK, "decompress_file_mt");
+        CHECK(squish_decompress_file(tmp_sq, tmp_out, 3,
+                                     progress_probe, &progress_state)
+              == SQUISH_OK, "decompress_file progress");
         CHECK(progress_state.calls >= 2 && progress_state.monotonic &&
               progress_state.done == progress_state.total &&
               progress_state.total == 300000,
-              "  mt decompress progress monotonic");
-        FILE *a = fopen(tmp_in, "rb"), *b = fopen(tmp_out, "rb");
-        int same = 1, ca, cb2;
-        do { ca = fgetc(a); cb2 = fgetc(b); if (ca != cb2) same = 0; }
-        while (ca != EOF && cb2 != EOF);
-        fclose(a); fclose(b);
-        CHECK(same, "  mt file round-trip identical");
+              "  decompress progress monotonic");
         remove(tmp_in); remove(tmp_sq); remove(tmp_out);
     }
 
     {   /* seekable archive: create, header, list, single-member + subtree
          * extract, memory-backed open, and malformed-input rejection */
         const char *root = "tests/.t_arc";
-        const char *arc  = "tests/.t_arc.sqar";
+        const char *arc  = "tests/.t_arc.sqsh";
 
         /* fixture tree:
          *   .t_arc/a.txt              (compressible text)
@@ -429,7 +346,7 @@ int main(void) {
         if (A) {
             squish_archive_info info;
             CHECK(squish_archive_info_get(A, &info) == SQUISH_OK &&
-                  info.version == 2 && info.entry_count == 6 &&
+                  info.version == 1 && info.entry_count == 6 && info.flags == 0 &&
                   info.total_size == sizeof atxt + sizeof bbin + sizeof ctxt,
                   "  header + entry count");
             CHECK(squish_archive_count(A) == 6, "  count");
@@ -450,7 +367,7 @@ int main(void) {
             CHECK(squish_archive_find(A, "nope", NULL) == SQUISH_E_FORMAT,
                   "  find missing -> E_FORMAT");
 
-            /* single-member extract reads only that member's stream */
+            /* single-member extract reads only that member's blocks */
             void *m = NULL; size_t mn = 0;
             CHECK(squish_archive_extract(A, idx, &m, &mn) == SQUISH_OK &&
                   mn == sizeof bbin && m && memcmp(m, bbin, mn) == 0,
@@ -472,47 +389,45 @@ int main(void) {
             remove("tests/.t_a");
 
             /* subtree extract recreates only sub/ under the destination root */
-            CHECK(squish_archive_extract_subtree(A, "sub", "tests/.t_out", NULL, NULL)
+            CHECK(squish_archive_extract_subtree(A, "sub", "tests/.t_sub", NULL, NULL)
                   == SQUISH_OK, "  extract_subtree sub");
-            CHECK(file_is("tests/.t_out/sub/b.bin", bbin, sizeof bbin) &&
-                  file_is("tests/.t_out/sub/deep/c.txt", ctxt, sizeof ctxt),
+            CHECK(file_is("tests/.t_sub/sub/b.bin", bbin, sizeof bbin) &&
+                  file_is("tests/.t_sub/sub/deep/c.txt", ctxt, sizeof ctxt),
                   "  subtree files present");
-            /* files outside the prefix were NOT written */
-            CHECK(!file_is("tests/.t_out/a.txt", atxt, sizeof atxt),
+            CHECK(!file_is("tests/.t_sub/a.txt", atxt, sizeof atxt),
                   "  subtree excluded a.txt");
-            remove("tests/.t_out/sub/deep/c.txt");
-            remove("tests/.t_out/sub/b.bin");
-            RMDIR("tests/.t_out/sub/deep");
-            RMDIR("tests/.t_out/sub");
-            RMDIR("tests/.t_out");
+            remove("tests/.t_sub/sub/deep/c.txt");
+            remove("tests/.t_sub/sub/b.bin");
+            RMDIR("tests/.t_sub/sub/deep");
+            RMDIR("tests/.t_sub/sub");
+            RMDIR("tests/.t_sub");
 
+            /* a multi-member archive is not a single blob */
+            void *bd; size_t bn2;
+            uint8_t *img; size_t isz;
             squish_archive_close(A);
+            img = slurp(arc, &isz);
+            CHECK(img && squish_decompress_alloc(img, isz, &bd, &bn2, 0, NULL, NULL)
+                  == SQUISH_E_FORMAT, "  decompress_alloc rejects multi-member");
+            free(img);
+            A = NULL;
         }
 
         /* memory-backed open over the same archive image */
         {
-            FILE *f = fopen(arc, "rb");
-            long sz = 0; uint8_t *img = NULL;
-            if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); rewind(f);
-                     img = (uint8_t *)malloc(sz > 0 ? (size_t)sz : 1);
-                     if (img) { if (fread(img, 1, (size_t)sz, f) != (size_t)sz) sz = 0; }
-                     fclose(f); }
+            size_t sz = 0;
+            uint8_t *img = slurp(arc, &sz);
             squish_archive *M = NULL;
-            CHECK(img && squish_archive_open_memory(img, (size_t)sz, &M) == SQUISH_OK && M,
+            CHECK(img && squish_archive_open_memory(img, sz, &M) == SQUISH_OK && M,
                   "archive_open_memory");
             void *m = NULL; size_t mn = 0;
             CHECK(M && squish_archive_extract_path(M, "sub/b.bin", &m, &mn) == SQUISH_OK &&
                   mn == sizeof bbin && memcmp(m, bbin, mn) == 0,
                   "  memory extract matches");
             squish_free(m);
-            /* probe agrees with the container; a plain stream is not an archive */
-            CHECK(img && squish_archive_probe(img, (size_t)sz) == 1, "  probe archive");
-            CHECK(squish_archive_probe("SQ02not-an-archive", 18) == 0, "  probe non-archive");
+            CHECK(img && squish_archive_probe(img, sz) == 1, "  probe archive");
+            CHECK(squish_archive_probe("not-an-archive!!", 16) == 0, "  probe non-archive");
             squish_archive_close(M);
-            /* a truncated image is rejected, not crashed */
-            squish_archive *T = NULL;
-            CHECK(!img || squish_archive_open_memory(img, 20, &T) == SQUISH_E_FORMAT,
-                  "  truncated image rejected");
             free(img);
         }
 

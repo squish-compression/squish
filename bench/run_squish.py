@@ -15,15 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Benchmark SQUISH across its compression modes with round-trip verification.
 
-Three modes are measured per corpus file:
+Two modes are measured per corpus file (both produce a one-member archive):
 
-  squish-single  ratio-optimal single-block stream   (c -t 1  /  d)
-  squish-mt      multi-threaded block-split stream    (c -t 0  /  d -t 0)
-  squish-sfx     self-extracting executable           (s       /  run it)
-
-The SFX size is the whole shippable executable (payload + extractor stub),
-and its round-trip is the real thing: the produced program is executed with
-no arguments and must unpack its embedded member back to the original bytes.
+  squish-single  ratio-optimal single-block layout    (c -t 1  /  d)
+  squish-mt      multi-threaded block-split layout     (c -t 0  /  d -t 0)
 
 Writes CSV rows: file,tool,orig_bytes,comp_bytes,compress_s,decompress_s,verified
 """
@@ -54,7 +49,7 @@ def run(args):
 
 def bench_stream(src, td, flags, tag):
     """Compress with `c <flags>`, decompress with `d <flags>`, verify."""
-    comp = os.path.join(td, tag + ".sq")
+    comp = os.path.join(td, tag + ".sqsh")
     rt = os.path.join(td, tag + ".out")
     t0 = time.time(); run(flags + ["c", src, comp]); ct = time.time() - t0
     t0 = time.time(); run(flags + ["d", comp, rt]); dt = time.time() - t0
@@ -62,25 +57,9 @@ def bench_stream(src, td, flags, tag):
     return os.path.getsize(comp), ct, dt, ok
 
 
-def bench_sfx(src, td):
-    """Build a self-extracting exe, then run it and verify the extraction."""
-    exe = os.path.join(td, "sfx.exe")
-    t0 = time.time(); run(["s", src, exe]); ct = time.time() - t0
-    # The stub extracts the embedded member (basename of src) into its cwd.
-    workdir = os.path.join(td, "extract")
-    os.makedirs(workdir, exist_ok=True)
-    t0 = time.time()
-    subprocess.run([exe], check=True, cwd=workdir, stderr=subprocess.DEVNULL)
-    dt = time.time() - t0
-    extracted = os.path.join(workdir, os.path.basename(src))
-    ok = os.path.exists(extracted) and filecmp.cmp(src, extracted, shallow=False)
-    return os.path.getsize(exe), ct, dt, ok
-
-
 MODES = [
     ("squish-single", lambda src, td: bench_stream(src, td, ["-t", "1"], "single")),
     ("squish-mt",     lambda src, td: bench_stream(src, td, ["-t", "0"], "mt")),
-    ("squish-sfx",    bench_sfx),
 ]
 
 

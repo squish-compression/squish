@@ -30,12 +30,15 @@
  *   4. A carryless 32-bit binary arithmetic coder codes the bit.
  * Decompression runs the identical model pipeline in lockstep.
  *
- * Container format "SQ02" (see docs/FORMAT.md):
- *   [0..3]  magic "SQ02"
- *   [4..11] original size, u64 little-endian
- *   [12]    mode: 0 = arithmetic-coded, 1 = stored (incompressible fallback)
- *   [13..]  payload
- *   [last4] FNV-1a 64 of the original data, folded to 32 bits, LE
+ * There is one on-disk format, the SQUISH archive (magic "SQSH", see
+ * docs/FORMAT.md). Its atom is a coded *block*:
+ *   [0]     mode: 0 = arithmetic-coded, 1 = stored (incompressible fallback)
+ *   [1..]   payload
+ *   [last4] FNV-1a 64 of the block's original bytes, folded to 32 bits, LE
+ * A block's original and compressed sizes are recorded by the enclosing
+ * archive index, so the block itself carries no magic or length. A member's
+ * data is one or more blocks (chunked for parallelism); the archive header,
+ * member blocks, and a compressed index make up the file.
  *
  * All state lives in a heap-allocated squish_ctx => no global mutable state,
  * safe for concurrent use from multiple threads.
@@ -70,25 +73,17 @@ typedef int64_t  i64;
 #define MINMATCH  6
 #define RECWIN    2048          /* record-length vote window */
 
-#define HDR_SIZE  13            /* magic + size + mode byte */
-#define CKS_SIZE  4
-#define OVERHEAD  (HDR_SIZE + CKS_SIZE)
+/* A coded block: 1 mode byte + payload + 4-byte checksum. Its original and
+ * compressed sizes come from the archive index, not the block. */
+#define BLK_MODE   1
+#define CKS_SIZE   4
+#define BLK_OVER   (BLK_MODE + CKS_SIZE)   /* fixed per-block overhead = 5 */
 
-static const u8 MAGIC[4] = { 'S', 'Q', '0', '2' };
 enum { MODE_CM = 0, MODE_STORED = 1 };
 
-/* multi-block container "SQ01" (see docs/FORMAT.md):
- *   [0..3]   magic "SQ01"
- *   [4..11]  total original size, u64 little-endian
- *   [12]     mode: 2 = multi-block
- *   [13..16] chunk count k, u32 little-endian
- *   [17..]   k * u32 LE: compressed size of each chunk
- *   then     k chunks, each a complete SQ02 stream (own checksum/fallback)
- * Chunks share no model state, so they compress and decompress in parallel. */
-static const u8 MAGIC_MB[4] = { 'S', 'Q', '0', '1' };
-enum { MODE_MB = 2 };
-#define MB_HDR_SIZE   17
-#define MB_MAX_CHUNKS 65536u    /* SQUISH_MAX_INPUT / SQUISH_MIN_CHUNK */
+/* Largest number of blocks a single member can hold (MAX_INPUT / MIN_CHUNK),
+ * used to bound forged index allocations. */
+#define MAX_BLOCKS 65536u
 
 /* ---------------- context: every bit of mutable state -------------------- */
 typedef struct squish_ctx {
@@ -467,7 +462,7 @@ static int sq_ncpu(void) {
 }
 #endif
 
-/* ---------------- public API ---------------------------------------------*/
+/* ---------------- public API: introspection ------------------------------*/
 SQUISH_API const char *squish_version(void) { return SQUISH_VERSION_STRING; }
 
 SQUISH_API const char *squish_strerror(int code) {
@@ -475,7 +470,7 @@ SQUISH_API const char *squish_strerror(int code) {
     case SQUISH_OK:          return "success";
     case SQUISH_E_PARAM:     return "invalid argument";
     case SQUISH_E_NOMEM:     return "out of memory";
-    case SQUISH_E_FORMAT:    return "not a SQUISH stream or stream corrupt";
+    case SQUISH_E_FORMAT:    return "not a SQUISH archive or archive corrupt";
     case SQUISH_E_DSTSIZE:   return "destination buffer too small";
     case SQUISH_E_TOOBIG:    return "input exceeds 4 GiB limit";
     case SQUISH_E_IO:        return "file I/O error";
@@ -484,46 +479,35 @@ SQUISH_API const char *squish_strerror(int code) {
     }
 }
 
-SQUISH_API size_t squish_compress_bound(size_t src_len) {
-    return src_len + OVERHEAD;      /* stored-mode fallback caps expansion */
+SQUISH_API int squish_threads(void) { return sq_ncpu(); }
+
+SQUISH_API void squish_free(void *p) { free(p); }
+
+/* Number of coded blocks a member of `orig` bytes uses at block size `chunk`
+ * (chunk >= 1): 0 for an empty member, else ceil(orig/chunk). */
+static u64 member_blocks(u64 orig, u64 chunk) {
+    return orig ? (orig + chunk - 1) / chunk : 0;
 }
 
-SQUISH_API int squish_decompressed_size(const void *src, size_t src_len,
-                                        uint64_t *out_size) {
-    if (!src || !out_size) return SQUISH_E_PARAM;
-    if (src_len < 12 ||
-        (memcmp(src, MAGIC, 4) != 0 && memcmp(src, MAGIC_MB, 4) != 0))
-        return SQUISH_E_FORMAT;
-    u64 n = get_le((const u8*)src + 4, 8);
-    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
-    *out_size = n;
-    return SQUISH_OK;
-}
+/* ---------------- coded block: the compression atom ----------------------- *
+ * A block is [mode u8][payload][checksum u32]; its original and compressed
+ * sizes live in the enclosing index. Stored mode caps a block at n+BLK_OVER. */
 
-static int compress_ex(const void *src, size_t src_len,
-                       void *dst, size_t *dst_len,
-                       squish_progress_fn cb, void *user) {
-    if ((!src && src_len) || !dst || !dst_len) return SQUISH_E_PARAM;
-    if ((u64)src_len >= SQUISH_MAX_INPUT)      return SQUISH_E_TOOBIG;
-    size_t cap = *dst_len;
-    size_t stored_size = OVERHEAD + src_len;
-    if (cap < OVERHEAD) return SQUISH_E_DSTSIZE;
+static int block_compress(const u8 *src, size_t n, u8 *dst, size_t cap,
+                          size_t *outlen, squish_progress_fn cb, void *user) {
+    if ((u64)n >= SQUISH_MAX_INPUT) return SQUISH_E_TOOBIG;
+    size_t stored_size = BLK_OVER + n;
+    if (cap < BLK_OVER) return SQUISH_E_DSTSIZE;
+    u64 cks = fnv1a64(src, n);
 
-    u8 *d = (u8*)dst;
-    memcpy(d, MAGIC, 4);
-    put_le(d + 4, (u64)src_len, 8);
-    u64 cks = fnv1a64((const u8*)src, src_len);
-
-    /* try context-mixing; stop early once it can't beat stored mode */
     Ctx *S = ctx_new((u8*)(uintptr_t)src, /*buf_write=*/0);
     if (!S) return SQUISH_E_NOMEM;
-    S->out = d + HDR_SIZE;
-    size_t cm_cap = (cap < stored_size ? cap : stored_size) - OVERHEAD;
-    S->out_cap = cm_cap;
+    S->out = dst + BLK_MODE;
+    S->out_cap = (cap < stored_size ? cap : stored_size) - BLK_OVER;
     enc_init(S);
-    for (size_t j = 0; j < src_len && !S->overflow; j++) {
-        if (cb && (j & 0xFFFFu) == 0) cb(j, src_len, user);
-        u8 b = ((const u8*)src)[j];
+    for (size_t j = 0; j < n && !S->overflow; j++) {
+        if (cb && (j & 0xFFFFu) == 0) cb(j, n, user);
+        u8 b = src[j];
         for (int i = 7; i >= 0; i--) {
             int y = (b >> i) & 1;
             int pr = predict(S);
@@ -537,62 +521,40 @@ static int compress_ex(const void *src, size_t src_len,
     ctx_free(S);
 
     if (!overflow) {
-        d[12] = MODE_CM;
-        put_le(d + HDR_SIZE + coded, cks & 0xffffffff, 4);
-        *dst_len = HDR_SIZE + coded + CKS_SIZE;
-        if (cb) cb(src_len, src_len, user);
+        dst[0] = MODE_CM;
+        put_le(dst + BLK_MODE + coded, cks & 0xffffffff, 4);
+        *outlen = BLK_MODE + coded + CKS_SIZE;
+        if (cb) cb(n, n, user);
         return SQUISH_OK;
     }
-    /* incompressible: store raw if there is room */
     if (cap < stored_size) return SQUISH_E_DSTSIZE;
-    d[12] = MODE_STORED;
-    if (src_len) memcpy(d + HDR_SIZE, src, src_len);
-    put_le(d + HDR_SIZE + src_len, cks & 0xffffffff, 4);
-    *dst_len = stored_size;
-    if (cb) cb(src_len, src_len, user);
+    dst[0] = MODE_STORED;
+    if (n) memcpy(dst + BLK_MODE, src, n);
+    put_le(dst + BLK_MODE + n, cks & 0xffffffff, 4);
+    *outlen = stored_size;
+    if (cb) cb(n, n, user);
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_compress(const void *src, size_t src_len,
-                               void *dst, size_t *dst_len) {
-    return compress_ex(src, src_len, dst, dst_len, NULL, NULL);
-}
-
-static int decompress_mb_ex(const void *src, size_t src_len,
-                            void *dst, size_t *dst_len,
-                            int nthreads, squish_progress_fn cb, void *user);
-
-static int decompress_ex(const void *src, size_t src_len,
-                         void *dst, size_t *dst_len,
-                         squish_progress_fn cb, void *user) {
-    if (!src || !dst_len || (!dst && *dst_len)) return SQUISH_E_PARAM;
-    if (src_len >= 4 && memcmp(src, MAGIC_MB, 4) == 0)
-        return decompress_mb_ex(src, src_len, dst, dst_len, 1, cb, user);
-    if (src_len < OVERHEAD || memcmp(src, MAGIC, 4) != 0)
-        return SQUISH_E_FORMAT;
-    const u8 *s = (const u8*)src;
-    u64 n = get_le(s + 4, 8);
-    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
-    int mode = s[12];
+static int block_decompress(const u8 *src, size_t csize, u8 *dst, size_t n,
+                            squish_progress_fn cb, void *user) {
+    if (csize < BLK_OVER) return SQUISH_E_FORMAT;
+    int mode = src[0];
     if (mode != MODE_CM && mode != MODE_STORED) return SQUISH_E_FORMAT;
-    if (*dst_len < n) { *dst_len = (size_t)n; return SQUISH_E_DSTSIZE; }
-    u32 want = (u32)get_le(s + src_len - CKS_SIZE, 4);
+    u32 want = (u32)get_le(src + csize - CKS_SIZE, 4);
 
     if (mode == MODE_STORED) {
-        if (src_len != OVERHEAD + n) return SQUISH_E_FORMAT;
-        if (n) memcpy(dst, s + HDR_SIZE, (size_t)n);
+        if (csize != BLK_OVER + n) return SQUISH_E_FORMAT;
+        if (n) memcpy(dst, src + BLK_MODE, n);
     } else {
-        Ctx *S = ctx_new((u8*)dst, /*buf_write=*/1);
+        Ctx *S = ctx_new(dst, /*buf_write=*/1);
         if (!S) return SQUISH_E_NOMEM;
-        S->in = s; S->in_pos = HDR_SIZE; S->in_end = src_len - CKS_SIZE;
+        S->in = src; S->in_pos = BLK_MODE; S->in_end = csize - CKS_SIZE;
         dec_init(S);
         for (u64 j = 0; j < n; j++) {
-            /* The decoder of a well-formed stream consumes exactly the bytes
-             * the encoder emitted, never the past-end filler. Sustained
-             * filler reads mean the stream is truncated or forged; bail
-             * instead of decoding up to 4 GiB of noise (a ~20-byte forged
-             * header would otherwise cost hours of CPU before the checksum
-             * finally rejects it). */
+            /* A well-formed block consumes exactly the encoder's bytes, never
+             * the past-end filler. Sustained filler reads mean a truncated or
+             * forged block; bail instead of decoding up to 4 GiB of noise. */
             if (S->starved > 64) { ctx_free(S); return SQUISH_E_FORMAT; }
             if (cb && (j & 0xFFFFu) == 0) cb(j, n, user);
             for (int i = 7; i >= 0; i--) {
@@ -603,26 +565,24 @@ static int decompress_ex(const void *src, size_t src_len,
         }
         ctx_free(S);
     }
-    if ((u32)(fnv1a64((const u8*)dst, (size_t)n) & 0xffffffff) != want)
-        return SQUISH_E_CHECKSUM;
-    *dst_len = (size_t)n;
+    if ((u32)(fnv1a64(dst, n) & 0xffffffff) != want) return SQUISH_E_CHECKSUM;
     if (cb) cb(n, n, user);
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_decompress(const void *src, size_t src_len,
-                                 void *dst, size_t *dst_len) {
-    return decompress_ex(src, src_len, dst, dst_len, NULL, NULL);
+SQUISH_API size_t squish_compress_bound(size_t src_len) {
+    /* header + member blocks (stored worst case) + a one-entry index block */
+    size_t k = src_len / SQUISH_MIN_CHUNK + 1;      /* max blocks             */
+    return 64 + src_len + BLK_OVER * k              /* member data region     */
+         + (25 + 8 * k + BLK_OVER)                  /* index: 1 entry, stored */
+         + 64;                                      /* slack                  */
 }
 
-/* ---------------- multi-block engine -------------------------------------- */
-
-/* Fans per-chunk progress into one monotonic (processed, total) sequence;
- * the mutex also serializes calls into the user's callback. */
+/* ---------------- multi-block progress fan-in ----------------------------- */
 typedef struct {
     squish_progress_fn cb; void *user;
     u64 total, agg;
-    u64 *cdone;                 /* per-chunk bytes reported so far */
+    u64 *cdone;                 /* per-block bytes reported so far */
     sq_mutex mu;
 } mt_prog;
 typedef struct { mt_prog *p; u32 idx; } chunk_prog;
@@ -641,7 +601,7 @@ static void mt_prog_cb(u64 done, u64 total, void *user) {
 static int mt_prog_init(mt_prog *p, squish_progress_fn cb, void *user,
                         u64 total, u32 nchunks, chunk_prog **cps) {
     *cps = NULL;
-    if (!cb) return 1;
+    if (!cb || nchunks == 0) return 1;
     p->cb = cb; p->user = user; p->total = total; p->agg = 0;
     p->cdone = (u64*)calloc(nchunks, sizeof(u64));
     *cps = (chunk_prog*)malloc((size_t)nchunks * sizeof(chunk_prog));
@@ -659,7 +619,7 @@ static void mt_prog_destroy(mt_prog *p, chunk_prog *cps) {
     free(p->cdone); free(cps);
 }
 
-/* Workers take chunks i = tid, tid + T, ...: equal-sized chunks make static
+/* Workers take blocks i = tid, tid + T, ...: equal-sized blocks make static
  * striding balance as well as a shared queue, with no synchronization. */
 typedef struct {
     /* compress */
@@ -667,8 +627,7 @@ typedef struct {
     u8 **bufs; size_t *lens;
     /* decompress */
     const u8 *s; u8 *dst;
-    const u64 *coff, *doff, *olen;
-    const u32 *clen;
+    const u64 *coff, *doff, *olen, *clen;
     /* shared */
     int *rcs; chunk_prog *cps;
     u32 nchunks, tid, nthreads;
@@ -680,12 +639,12 @@ static sq_thread_ret SQ_THREAD_CALL compress_worker(void *arg) {
         u64 off = (u64)i * a->chunk;
         size_t len = (size_t)(a->chunk <= a->src_len - off ? a->chunk
                                                            : a->src_len - off);
-        size_t outn = len + OVERHEAD;
+        size_t outn = len + BLK_OVER;
         a->bufs[i] = (u8*)malloc(outn);
         if (!a->bufs[i]) { a->rcs[i] = SQUISH_E_NOMEM; continue; }
-        a->rcs[i] = compress_ex(a->src + off, len, a->bufs[i], &outn,
-                                a->cps ? mt_prog_cb : NULL,
-                                a->cps ? (void*)&a->cps[i] : NULL);
+        a->rcs[i] = block_compress(a->src + off, len, a->bufs[i], outn, &outn,
+                                   a->cps ? mt_prog_cb : NULL,
+                                   a->cps ? (void*)&a->cps[i] : NULL);
         a->lens[i] = outn;
     }
     return SQ_THREAD_DONE;
@@ -694,16 +653,15 @@ static sq_thread_ret SQ_THREAD_CALL compress_worker(void *arg) {
 static sq_thread_ret SQ_THREAD_CALL decompress_worker(void *arg) {
     mt_args *a = (mt_args*)arg;
     for (u32 i = a->tid; i < a->nchunks; i += a->nthreads) {
-        size_t dn = (size_t)a->olen[i];
-        a->rcs[i] = decompress_ex(a->s + a->coff[i], a->clen[i],
-                                  a->dst + a->doff[i], &dn,
-                                  a->cps ? mt_prog_cb : NULL,
-                                  a->cps ? (void*)&a->cps[i] : NULL);
+        a->rcs[i] = block_decompress(a->s + a->coff[i], (size_t)a->clen[i],
+                                     a->dst + a->doff[i], (size_t)a->olen[i],
+                                     a->cps ? mt_prog_cb : NULL,
+                                     a->cps ? (void*)&a->cps[i] : NULL);
     }
     return SQ_THREAD_DONE;
 }
 
-/* Run `fn` over `nchunks` chunks on `nthreads` threads (worker 0 runs on the
+/* Run `fn` over `nchunks` blocks on `nthreads` threads (worker 0 runs on the
  * calling thread; a failed spawn folds that stripe into the caller too). */
 static void mt_run(sq_thread_fn fn, mt_args *proto, u32 nthreads,
                    mt_args *args, sq_thread *tids) {
@@ -724,18 +682,18 @@ static void mt_run(sq_thread_fn fn, mt_args *proto, u32 nthreads,
     for (u32 t = 0; t < started; t++) sq_thread_join(tids[t]);
 }
 
-static int compress_mt_ex(const void *src, size_t src_len,
-                          void *dst, size_t *dst_len,
-                          int nthreads, size_t chunk_size,
-                          squish_progress_fn cb, void *user) {
-    if ((!src && src_len) || !dst || !dst_len) return SQUISH_E_PARAM;
-    if ((u64)src_len >= SQUISH_MAX_INPUT)      return SQUISH_E_TOOBIG;
-    u64 chunk = chunk_size ? chunk_size : SQUISH_DEFAULT_CHUNK;
-    if (chunk < SQUISH_MIN_CHUNK) chunk = SQUISH_MIN_CHUNK;
-    if ((u64)src_len <= chunk)
-        return compress_ex(src, src_len, dst, dst_len, cb, user);
+/* Compress a member's bytes into k = ceil(src_len/chunk) coded blocks (0 for
+ * an empty member). On success returns malloc'd arrays *bufs (each a block)
+ * and *lens, and *k; the caller frees every *bufs[i] plus *bufs and *lens.
+ * `chunk` is the effective (>= MIN, non-zero) block size actually used. */
+static int compress_member(const u8 *src, size_t src_len, int nthreads,
+                           u64 chunk, u8 ***bufs_out, size_t **lens_out,
+                           u32 *k_out, squish_progress_fn cb, void *user) {
+    *bufs_out = NULL; *lens_out = NULL; *k_out = 0;
+    if ((u64)src_len >= SQUISH_MAX_INPUT) return SQUISH_E_TOOBIG;
+    if (src_len == 0) return SQUISH_OK;                 /* empty: no blocks */
 
-    u32 k = (u32)(((u64)src_len + chunk - 1) / chunk);
+    u32 k = (u32)member_blocks(src_len, chunk);
     int T = nthreads > 0 ? nthreads : sq_ncpu();
     if ((u32)T > k) T = (int)k;
 
@@ -748,74 +706,40 @@ static int compress_mt_ex(const void *src, size_t src_len,
     int rc = SQUISH_OK;
     if (!bufs || !lens || !rcs || !args || !tids ||
         !mt_prog_init(&prog, cb, user, src_len, k, &cps)) {
-        rc = SQUISH_E_NOMEM;
-        goto done;
+        rc = SQUISH_E_NOMEM; goto done;
     }
-
     {
         mt_args proto;
         memset(&proto, 0, sizeof proto);
-        proto.src = (const u8*)src; proto.src_len = src_len;
-        proto.chunk = chunk;
+        proto.src = src; proto.src_len = src_len; proto.chunk = chunk;
         proto.bufs = bufs; proto.lens = lens;
         proto.rcs = rcs; proto.cps = cps; proto.nchunks = k;
         mt_run(compress_worker, &proto, (u32)T, args, tids);
     }
     for (u32 i = 0; i < k && rc == SQUISH_OK; i++) rc = rcs[i];
-    if (rc != SQUISH_OK) goto done;
-
-    {
-        size_t cap = *dst_len, stored_size = OVERHEAD + src_len;
-        u64 total = MB_HDR_SIZE + 4ull * k;
-        for (u32 i = 0; i < k; i++) total += lens[i];
-        u8 *d = (u8*)dst;
-        if (total < stored_size && total <= cap) {
-            memcpy(d, MAGIC_MB, 4);
-            put_le(d + 4, (u64)src_len, 8);
-            d[12] = MODE_MB;
-            put_le(d + 13, k, 4);
-            size_t w = MB_HDR_SIZE;
-            for (u32 i = 0; i < k; i++, w += 4) put_le(d + w, lens[i], 4);
-            for (u32 i = 0; i < k; i++) {
-                memcpy(d + w, bufs[i], lens[i]);
-                w += lens[i];
-            }
-            *dst_len = w;
-        } else if (stored_size <= cap) {
-            memcpy(d, MAGIC, 4);
-            put_le(d + 4, (u64)src_len, 8);
-            d[12] = MODE_STORED;
-            if (src_len) memcpy(d + HDR_SIZE, src, src_len);
-            put_le(d + HDR_SIZE + src_len,
-                   fnv1a64((const u8*)src, src_len) & 0xffffffff, 4);
-            *dst_len = stored_size;
-        } else rc = SQUISH_E_DSTSIZE;
-    }
-    if (rc == SQUISH_OK && cb) cb(src_len, src_len, user);
 
 done:
-    if (bufs) for (u32 i = 0; i < k; i++) free(bufs[i]);
     mt_prog_destroy(&prog, cps);
-    free(bufs); free(lens); free(rcs); free(args); free(tids);
-    return rc;
+    free(rcs); free(args); free(tids);
+    if (rc != SQUISH_OK) {
+        if (bufs) for (u32 i = 0; i < k; i++) free(bufs[i]);
+        free(bufs); free(lens);
+        return rc;
+    }
+    *bufs_out = bufs; *lens_out = lens; *k_out = k;
+    return SQUISH_OK;
 }
 
-static int decompress_mb_ex(const void *src, size_t src_len,
-                            void *dst, size_t *dst_len,
-                            int nthreads, squish_progress_fn cb, void *user) {
-    if (!src || !dst_len || (!dst && *dst_len)) return SQUISH_E_PARAM;
-    const u8 *s = (const u8*)src;
-    if (src_len < MB_HDR_SIZE + 4 || memcmp(s, MAGIC_MB, 4) != 0 ||
-        s[12] != MODE_MB)
-        return SQUISH_E_FORMAT;
-    u64 n = get_le(s + 4, 8);
-    u32 k = (u32)get_le(s + 13, 4);
-    if (n >= SQUISH_MAX_INPUT || k < 1 || k > MB_MAX_CHUNKS) return SQUISH_E_FORMAT;
-    u64 table_end = MB_HDR_SIZE + 4ull * k;
-    if (src_len < table_end) return SQUISH_E_FORMAT;
-    if (*dst_len < n) { *dst_len = (size_t)n; return SQUISH_E_DSTSIZE; }
-
-    u32 *clen = (u32*)malloc((size_t)k * sizeof(u32));
+/* Decode a member: `data` points at its first block; `clen[i]` is each block's
+ * compressed length (blocks are contiguous). Writes `orig` bytes to dst. */
+static int decompress_member(const u8 *data, u64 data_len, const u64 *clen,
+                             u32 k, u64 orig, u64 chunk, u8 *dst, int nthreads,
+                             squish_progress_fn cb, void *user) {
+    if (k == 0) {
+        if (orig != 0) return SQUISH_E_FORMAT;
+        if (cb) cb(0, 0, user);
+        return SQUISH_OK;
+    }
     u64 *coff = (u64*)malloc((size_t)k * sizeof(u64));
     u64 *doff = (u64*)malloc((size_t)k * sizeof(u64));
     u64 *olen = (u64*)malloc((size_t)k * sizeof(u64));
@@ -823,298 +747,62 @@ static int decompress_mb_ex(const void *src, size_t src_len,
     mt_args *args = NULL; sq_thread *tids = NULL;
     mt_prog prog; chunk_prog *cps = NULL;
     int rc = SQUISH_OK;
-    if (!clen || !coff || !doff || !olen || !rcs) { rc = SQUISH_E_NOMEM; goto done; }
+    if (!coff || !doff || !olen || !rcs) { rc = SQUISH_E_NOMEM; goto done; }
 
-    {   /* chunk table: offsets must tile the payload and the output exactly;
-         * chunks must themselves be SQ02 (no recursive containers) */
-        u64 co = table_end, dof = 0;
+    {   /* block table: contiguous compressed spans tiling [0, data_len);
+         * per-block original sizes derived from the uniform chunk. */
+        u64 co = 0, dof = 0;
         for (u32 i = 0; i < k; i++) {
-            clen[i] = (u32)get_le(s + MB_HDR_SIZE + 4ull*i, 4);
             coff[i] = co; doff[i] = dof;
-            if (clen[i] < OVERHEAD || clen[i] > src_len - co) {
+            if (clen[i] < BLK_OVER || clen[i] > data_len - co) {
                 rc = SQUISH_E_FORMAT; goto done;
             }
-            if (memcmp(s + co, MAGIC, 4) != 0) { rc = SQUISH_E_FORMAT; goto done; }
-            olen[i] = get_le(s + co + 4, 8);
-            /* no encoder emits empty chunks; rejecting them stops a forged
-             * table from demanding 64k pointless model setups (~150 MB of
-             * table init each) for zero output */
-            if (olen[i] == 0 || olen[i] > n - dof) { rc = SQUISH_E_FORMAT; goto done; }
+            olen[i] = chunk <= orig - dof ? chunk : orig - dof;
             co += clen[i]; dof += olen[i];
         }
-        if (co != src_len || dof != n) { rc = SQUISH_E_FORMAT; goto done; }
+        if (co != data_len || dof != orig) { rc = SQUISH_E_FORMAT; goto done; }
     }
-
     {
         int T = nthreads > 0 ? nthreads : sq_ncpu();
         if ((u32)T > k) T = (int)k;
         args = (mt_args*)calloc(T, sizeof(mt_args));
         tids = (sq_thread*)calloc(T, sizeof(sq_thread));
-        if (!args || !tids || !mt_prog_init(&prog, cb, user, n, k, &cps)) {
+        if (!args || !tids || !mt_prog_init(&prog, cb, user, orig, k, &cps)) {
             rc = SQUISH_E_NOMEM; goto done;
         }
         mt_args proto;
         memset(&proto, 0, sizeof proto);
-        proto.s = s; proto.dst = (u8*)dst;
-        proto.coff = coff; proto.doff = doff;
-        proto.olen = olen; proto.clen = clen;
+        proto.s = data; proto.dst = dst;
+        proto.coff = coff; proto.doff = doff; proto.olen = olen; proto.clen = clen;
         proto.rcs = rcs; proto.cps = cps; proto.nchunks = k;
         mt_run(decompress_worker, &proto, (u32)T, args, tids);
     }
     for (u32 i = 0; i < k && rc == SQUISH_OK; i++) rc = rcs[i];
-    if (rc == SQUISH_OK) {
-        *dst_len = (size_t)n;
-        if (cb) cb(n, n, user);
-    }
+    if (rc == SQUISH_OK && cb) cb(orig, orig, user);
 
 done:
     mt_prog_destroy(&prog, cps);
-    free(clen); free(coff); free(doff); free(olen); free(rcs);
-    free(args); free(tids);
-    return rc;
-}
-
-SQUISH_API int squish_threads(void) { return sq_ncpu(); }
-
-SQUISH_API int squish_compress_mt(const void *src, size_t src_len,
-                                  void *dst, size_t *dst_len,
-                                  int nthreads, size_t chunk_size,
-                                  squish_progress_fn progress, void *user) {
-    return compress_mt_ex(src, src_len, dst, dst_len,
-                          nthreads, chunk_size, progress, user);
-}
-
-SQUISH_API int squish_decompress_mt(const void *src, size_t src_len,
-                                    void *dst, size_t *dst_len,
-                                    int nthreads,
-                                    squish_progress_fn progress, void *user) {
-    if (src && src_len >= 4 && memcmp(src, MAGIC_MB, 4) == 0)
-        return decompress_mb_ex(src, src_len, dst, dst_len,
-                                nthreads, progress, user);
-    return decompress_ex(src, src_len, dst, dst_len, progress, user);
-}
-
-static int compress_alloc_ex(const void *src, size_t src_len,
-                             void **dst, size_t *dst_len,
-                             squish_progress_fn cb, void *user) {
-    if (!dst || !dst_len) return SQUISH_E_PARAM;
-    *dst = NULL; *dst_len = 0;
-    size_t cap = squish_compress_bound(src_len);
-    u8 *buf = (u8*)malloc(cap);
-    if (!buf) return SQUISH_E_NOMEM;
-    size_t out = cap;
-    int rc = compress_ex(src, src_len, buf, &out, cb, user);
-    if (rc != SQUISH_OK) { free(buf); return rc; }
-    u8 *trim = (u8*)realloc(buf, out ? out : 1);
-    *dst = trim ? trim : buf;
-    *dst_len = out;
-    return SQUISH_OK;
-}
-
-SQUISH_API int squish_compress_alloc(const void *src, size_t src_len,
-                                     void **dst, size_t *dst_len) {
-    return compress_alloc_ex(src, src_len, dst, dst_len, NULL, NULL);
-}
-
-static int decompress_alloc_ex(const void *src, size_t src_len,
-                               void **dst, size_t *dst_len,
-                               squish_progress_fn cb, void *user) {
-    if (!dst || !dst_len) return SQUISH_E_PARAM;
-    *dst = NULL; *dst_len = 0;
-    u64 n;
-    int rc = squish_decompressed_size(src, src_len, &n);
-    if (rc != SQUISH_OK) return rc;
-    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
-    u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
-    if (!buf) return SQUISH_E_NOMEM;
-    size_t out = (size_t)n;
-    rc = decompress_ex(src, src_len, buf, &out, cb, user);
-    if (rc != SQUISH_OK) { free(buf); return rc; }
-    *dst = buf; *dst_len = out;
-    return SQUISH_OK;
-}
-
-SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
-                                       void **dst, size_t *dst_len) {
-    return decompress_alloc_ex(src, src_len, dst, dst_len, NULL, NULL);
-}
-
-SQUISH_API int squish_compress_alloc_mt(const void *src, size_t src_len,
-                                        void **dst, size_t *dst_len,
-                                        int nthreads, size_t chunk_size,
-                                        squish_progress_fn progress,
-                                        void *user) {
-    if (!dst || !dst_len) return SQUISH_E_PARAM;
-    *dst = NULL; *dst_len = 0;
-    size_t cap = squish_compress_bound(src_len);
-    u8 *buf = (u8*)malloc(cap);
-    if (!buf) return SQUISH_E_NOMEM;
-    size_t out = cap;
-    int rc = compress_mt_ex(src, src_len, buf, &out,
-                            nthreads, chunk_size, progress, user);
-    if (rc != SQUISH_OK) { free(buf); return rc; }
-    u8 *trim = (u8*)realloc(buf, out ? out : 1);
-    *dst = trim ? trim : buf;
-    *dst_len = out;
-    return SQUISH_OK;
-}
-
-SQUISH_API int squish_decompress_alloc_mt(const void *src, size_t src_len,
-                                          void **dst, size_t *dst_len,
-                                          int nthreads,
-                                          squish_progress_fn progress,
-                                          void *user) {
-    if (!dst || !dst_len) return SQUISH_E_PARAM;
-    *dst = NULL; *dst_len = 0;
-    u64 n;
-    int rc = squish_decompressed_size(src, src_len, &n);
-    if (rc != SQUISH_OK) return rc;
-    if (n >= SQUISH_MAX_INPUT) return SQUISH_E_FORMAT;
-    u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
-    if (!buf) return SQUISH_E_NOMEM;
-    size_t out = (size_t)n;
-    rc = squish_decompress_mt(src, src_len, buf, &out,
-                              nthreads, progress, user);
-    if (rc != SQUISH_OK) { free(buf); return rc; }
-    *dst = buf; *dst_len = out;
-    return SQUISH_OK;
-}
-
-SQUISH_API void squish_free(void *p) { free(p); }
-
-/* ---------------- file helpers ------------------------------------------- */
-
-/* 64-bit stream offsets: plain ftell returns long, which is 32-bit on
- * Windows — a >=2 GiB input would be mis-sized (and on a 32-bit size_t the
- * cast below could silently truncate what gets compressed). */
-#if defined(_WIN32)
-#  define sq_ftell64(f) _ftelli64(f)
-#else
-#  define sq_ftell64(f) ftello(f)
-#endif
-
-static int read_whole(const char *path, u8 **data, size_t *len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return SQUISH_E_IO;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return SQUISH_E_IO; }
-    long long n = sq_ftell64(f);
-    if (n < 0) { fclose(f); return SQUISH_E_IO; }
-    if ((unsigned long long)n > (size_t)-1) { fclose(f); return SQUISH_E_TOOBIG; }
-    rewind(f);
-    u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
-    if (!buf) { fclose(f); return SQUISH_E_NOMEM; }
-    if (n && fread(buf, 1, (size_t)n, f) != (size_t)n) {
-        free(buf); fclose(f); return SQUISH_E_IO;
-    }
-    fclose(f);
-    *data = buf; *len = (size_t)n;
-    return SQUISH_OK;
-}
-static int write_whole(const char *path, const u8 *data, size_t len) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return SQUISH_E_IO;
-    if (len && fwrite(data, 1, len, f) != len) { fclose(f); return SQUISH_E_IO; }
-    return fclose(f) == 0 ? SQUISH_OK : SQUISH_E_IO;
-}
-
-SQUISH_API int squish_compress_file2(const char *src_path,
-                                     const char *dst_path,
-                                     squish_progress_fn progress, void *user) {
-    if (!src_path || !dst_path) return SQUISH_E_PARAM;
-    u8 *in; size_t n;
-    int rc = read_whole(src_path, &in, &n);
-    if (rc != SQUISH_OK) return rc;
-    void *out; size_t outn;
-    rc = compress_alloc_ex(in, n, &out, &outn, progress, user);
-    free(in);
-    if (rc != SQUISH_OK) return rc;
-    rc = write_whole(dst_path, (const u8*)out, outn);
-    squish_free(out);
-    return rc;
-}
-
-SQUISH_API int squish_compress_file(const char *src_path,
-                                    const char *dst_path) {
-    return squish_compress_file2(src_path, dst_path, NULL, NULL);
-}
-
-SQUISH_API int squish_decompress_file2(const char *src_path,
-                                       const char *dst_path,
-                                       squish_progress_fn progress,
-                                       void *user) {
-    if (!src_path || !dst_path) return SQUISH_E_PARAM;
-    u8 *in; size_t n;
-    int rc = read_whole(src_path, &in, &n);
-    if (rc != SQUISH_OK) return rc;
-    void *out; size_t outn;
-    rc = decompress_alloc_ex(in, n, &out, &outn, progress, user);
-    free(in);
-    if (rc != SQUISH_OK) return rc;
-    rc = write_whole(dst_path, (const u8*)out, outn);
-    squish_free(out);
-    return rc;
-}
-
-SQUISH_API int squish_decompress_file(const char *src_path,
-                                      const char *dst_path) {
-    return squish_decompress_file2(src_path, dst_path, NULL, NULL);
-}
-
-SQUISH_API int squish_compress_file_mt(const char *src_path,
-                                       const char *dst_path,
-                                       int nthreads, size_t chunk_size,
-                                       squish_progress_fn progress,
-                                       void *user) {
-    if (!src_path || !dst_path) return SQUISH_E_PARAM;
-    u8 *in; size_t n;
-    int rc = read_whole(src_path, &in, &n);
-    if (rc != SQUISH_OK) return rc;
-    void *out; size_t outn;
-    rc = squish_compress_alloc_mt(in, n, &out, &outn,
-                                  nthreads, chunk_size, progress, user);
-    free(in);
-    if (rc != SQUISH_OK) return rc;
-    rc = write_whole(dst_path, (const u8*)out, outn);
-    squish_free(out);
-    return rc;
-}
-
-SQUISH_API int squish_decompress_file_mt(const char *src_path,
-                                         const char *dst_path,
-                                         int nthreads,
-                                         squish_progress_fn progress,
-                                         void *user) {
-    if (!src_path || !dst_path) return SQUISH_E_PARAM;
-    u8 *in; size_t n;
-    int rc = read_whole(src_path, &in, &n);
-    if (rc != SQUISH_OK) return rc;
-    void *out; size_t outn;
-    rc = squish_decompress_alloc_mt(in, n, &out, &outn,
-                                    nthreads, progress, user);
-    free(in);
-    if (rc != SQUISH_OK) return rc;
-    rc = write_whole(dst_path, (const u8*)out, outn);
-    squish_free(out);
+    free(coff); free(doff); free(olen); free(rcs); free(args); free(tids);
     return rc;
 }
 
 /* ============================================================================
- * Seekable archive container "SQAR" (see docs/FORMAT.md §12)
+ * SQUISH archive: the one on-disk format (see docs/FORMAT.md)
  *
- * A directory becomes a header, one independently-compressed §1 stream per
- * file, and a compressed index of (path, mode, size, stream offset/size). A
- * reader inflates the small index at open time, then reaches any single member
- * by seeking to its stream — the rest of the archive is never touched. All
- * integers little-endian.
+ * A header, one independently-compressed member per file (each a list of
+ * coded blocks), and a compressed index of (path, mode, size, block layout).
+ * A reader inflates the small index at open time, then reaches any single
+ * member by seeking to its blocks — the rest is never touched. LE integers.
  *
- *   0   8  magic "SQAR02\n\x1a"
- *   8   4  version u32 (2)          16  8  entry_count u64
- *   12  4  flags   u32 (0)          24  8  total_size  u64 (sum of file sizes)
- *   32  8  index_offset u64         40  8  index_comp_size u64
- *   48  8  index_orig_size u64      56  ... member streams, then index blob
+ *   0  8  magic "SQSH\r\n\x1a\n"     16  8  entry_count u64
+ *   8  4  version u32 (1)            24  8  total_size u64 (sum of file sizes)
+ *   12 4  flags   u32 (0)            32  8  chunk_size u64
+ *   40 8  index_offset u64           48  8  index_size u64 (compressed)
+ *   56 8  index_orig_size u64        64  ... member blocks, then index block
  *
- * Index entry: type u8 | mode u32 | orig u64 | coff u64 | csize u64 |
- *              plen u32 | path[plen]     (dirs carry orig/coff/csize = 0)
+ * Index entry: type u8 | mode u32 | orig u64 | data_off u64 |
+ *              (ceil(orig/chunk)) x (csize u64) | plen u32 | path[plen]
+ * (a directory carries orig/data_off = 0 and no block sizes.)
  * ==========================================================================*/
 #include <errno.h>
 #if defined(_WIN32)
@@ -1126,16 +814,19 @@ SQUISH_API int squish_decompress_file_mt(const char *src_path,
 #  include <dirent.h>
 #endif
 
-static const u8 SQAR_MAGIC[8] = { 'S','Q','A','R','0','2','\n','\x1a' };
-#define SQAR_VERSION    2u
-#define SQAR_HDR        56u        /* fixed container header size            */
-#define SQAR_ENT_FIXED  33u        /* type1+mode4+orig8+coff8+csize8+plen4   */
-#define SQAR_MAX_PATH   65535u
+static const u8 ARC_MAGIC[8] = { 'S','Q','S','H', 0x0D, 0x0A, 0x1A, 0x0A };
+#define ARC_VERSION   1u
+#define ARC_FLAG_SINGLE 1u         /* archive is one file/blob, not a tree   */
+#define ARC_HDR       64u          /* fixed container header size            */
+#define ARC_ENT_FIXED 25u          /* type1+mode4+orig8+doff8+plen4          */
+#define ARC_MAX_PATH  65535u
 
 #if defined(_WIN32)
 #  define sq_fseek64(f,o) _fseeki64((f),(long long)(o),SEEK_SET)
+#  define sq_ftell64(f)   _ftelli64(f)
 #else
 #  define sq_fseek64(f,o) fseeko((f),(off_t)(o),SEEK_SET)
+#  define sq_ftell64(f)   ftello(f)
 #endif
 
 /* ---------------- growable byte buffer ----------------------------------- */
@@ -1163,8 +854,6 @@ static int gbuf_u32(gbuf *b, u32 v) { u8 t[4]; put_le(t, v, 4); return gbuf_put(
 static int gbuf_u64(gbuf *b, u64 v) { u8 t[8]; put_le(t, v, 8); return gbuf_put(b, t, 8); }
 
 /* ---------------- path helpers ------------------------------------------- */
-
-/* malloc "<a>/<b>", or a plain copy of b when a is empty/NULL. NULL on OOM. */
 static char *path_join(const char *a, const char *b) {
     size_t la = a ? strlen(a) : 0, lb = strlen(b);
     char *r = (char*)malloc(la + 1 + lb + 1);
@@ -1173,8 +862,6 @@ static char *path_join(const char *a, const char *b) {
     else    { memcpy(r, b, lb + 1); }
     return r;
 }
-
-/* malloc'd copy of `path` with trailing '/' and '\\' trimmed (never to empty). */
 static char *strip_trailing_sep(const char *path) {
     size_t n = strlen(path);
     while (n > 1 && (path[n-1] == '/' || path[n-1] == '\\')) n--;
@@ -1186,7 +873,8 @@ static char *strip_trailing_sep(const char *path) {
 
 /* A stored path is safe iff it is relative and every component is non-empty,
  * not "." or "..", and free of ':' and '\\' — so an archive can never write
- * outside the extraction root. */
+ * outside the extraction root. The empty path is reserved for the unnamed
+ * member of a buffer/blob archive and is handled separately by callers. */
 static int arc_path_safe(const char *p, size_t n) {
     if (n == 0 || p[0] == '/') return 0;
     for (size_t i = 0; i < n; ) {
@@ -1241,8 +929,6 @@ static u64 path_size(const char *p) {
     return stat(p, &s) == 0 ? (u64)s.st_size : 0;
 #endif
 }
-
-/* Create one directory; success if it already exists. */
 static int make_dir(const char *p) {
 #if defined(_WIN32)
     if (_mkdir(p) == 0) return 0;
@@ -1251,10 +937,6 @@ static int make_dir(const char *p) {
 #endif
     return errno == EEXIST ? 0 : -1;
 }
-
-/* Create out_root and every directory along the relative path `rel`. When
- * include_last is 0, stop before rel's final component (create parents only,
- * for a file); when 1, create rel itself too (a directory entry). */
 static int make_dirs(const char *out_root, const char *rel, int include_last) {
     if (make_dir(out_root) != 0) return -1;
     size_t rl = strlen(out_root);
@@ -1276,8 +958,6 @@ static int make_dirs(const char *out_root, const char *rel, int include_last) {
     free(w);
     return rc;
 }
-
-/* Write `n` bytes to `path`, applying unix `mode` where supported. */
 static int write_file_bytes(const char *path, const u8 *d, size_t n, unsigned mode) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -1290,6 +970,25 @@ static int write_file_bytes(const char *path, const u8 *d, size_t n, unsigned mo
     (void)mode;
 #endif
     return 0;
+}
+
+/* ---------------- file slurp/spew ---------------------------------------- */
+static int read_whole(const char *path, u8 **data, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return SQUISH_E_IO;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return SQUISH_E_IO; }
+    long long n = sq_ftell64(f);
+    if (n < 0) { fclose(f); return SQUISH_E_IO; }
+    if ((unsigned long long)n > (size_t)-1) { fclose(f); return SQUISH_E_TOOBIG; }
+    rewind(f);
+    u8 *buf = (u8*)malloc(n ? (size_t)n : 1);
+    if (!buf) { fclose(f); return SQUISH_E_NOMEM; }
+    if (n && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf); fclose(f); return SQUISH_E_IO;
+    }
+    fclose(f);
+    *data = buf; *len = (size_t)n;
+    return SQUISH_OK;
 }
 
 /* ---------------- directory listing (sorted, reproducible) --------------- */
@@ -1351,12 +1050,18 @@ static int list_dir(const char *dir, char ***out, size_t *out_n) {
     return 0;
 }
 
-/* ---------------- entry list (shared by writer and reader) --------------- */
-typedef struct { u8 type; u32 mode; u64 orig, coff, csize; char *path; } arc_ent;
+/* ---------------- entry list (shared by writer and reader) --------------- *
+ * Each entry carries the member's block layout: data_off and one compressed
+ * size per block (nblk = ceil(orig/chunk), 0 for a dir or empty file). */
+typedef struct {
+    u8   type; u32 mode; u64 orig, data_off;
+    u64 *csz; u32 nblk;
+    char *path;
+} arc_ent;
 typedef struct { arc_ent *e; size_t n, cap; } arc_list;
 
 static void arc_list_free(arc_list *L) {
-    for (size_t i = 0; i < L->n; i++) free(L->e[i].path);
+    for (size_t i = 0; i < L->n; i++) { free(L->e[i].path); free(L->e[i].csz); }
     free(L->e);
     L->e = NULL; L->n = L->cap = 0;
 }
@@ -1370,150 +1075,139 @@ static int arc_list_add(arc_list *L, u8 type, u32 mode, u64 orig, char *path) {
     }
     arc_ent *en = &L->e[L->n++];
     en->type = type; en->mode = mode; en->orig = orig;
-    en->coff = 0; en->csize = 0; en->path = path;
+    en->data_off = 0; en->csz = NULL; en->nblk = 0; en->path = path;
     return 0;
 }
 
-/* ---------------- writer ------------------------------------------------- */
-
-/* Walk fs_dir, appending each member (dirs before their contents, siblings
- * sorted) to L with its archive-relative path arc_pre/<name>; sum file sizes
- * into *total. Does not read file contents. */
-static int arc_scan(const char *fs_dir, const char *arc_pre,
-                    arc_list *L, u64 *total) {
-    char **names; size_t n;
-    if (list_dir(fs_dir, &names, &n) != 0) return SQUISH_E_IO;
-    int rc = SQUISH_OK;
-    for (size_t i = 0; i < n && rc == SQUISH_OK; i++) {
-        char *fs  = path_join(fs_dir, names[i]);
-        char *arc = path_join(arc_pre, names[i]);
-        if (!fs || !arc) { free(fs); free(arc); rc = SQUISH_E_NOMEM; break; }
-        if (strlen(arc) > SQAR_MAX_PATH) { free(fs); free(arc); rc = SQUISH_E_FORMAT; break; }
-        if (path_is_dir(fs)) {
-            if (arc_list_add(L, 1, path_mode(fs, 0755), 0, arc) != 0) {
-                rc = SQUISH_E_NOMEM;
-            } else {
-                rc = arc_scan(fs, L->e[L->n - 1].path, L, total);  /* arc owned by L */
-            }
-        } else if (path_is_regular(fs)) {
-            u64 sz = path_size(fs);
-            if (arc_list_add(L, 0, path_mode(fs, 0644), sz, arc) != 0) rc = SQUISH_E_NOMEM;
-            else *total += sz;
-        } else {
-            free(arc);      /* skip sockets/fifos/dangling links */
-        }
-        free(fs);
-    }
-    free_names(names, n);
-    return rc;
+/* ---------------- effective chunk ---------------------------------------- */
+static u64 eff_chunk(size_t chunk_size) {
+    u64 c = chunk_size ? (u64)chunk_size : (u64)SQUISH_DEFAULT_CHUNK;
+    if (c < SQUISH_MIN_CHUNK) c = SQUISH_MIN_CHUNK;
+    return c;
 }
 
-/* Serialize L's metadata into a fresh index buffer (caller frees idx->p). */
+/* ---------------- index (de)serialization -------------------------------- */
 static int arc_build_index(const arc_list *L, gbuf *idx) {
     for (size_t i = 0; i < L->n; i++) {
         const arc_ent *e = &L->e[i];
         size_t plen = strlen(e->path);
         if (gbuf_u8(idx, e->type) || gbuf_u32(idx, e->mode) ||
-            gbuf_u64(idx, e->orig) || gbuf_u64(idx, e->coff) ||
-            gbuf_u64(idx, e->csize) || gbuf_u32(idx, (u32)plen) ||
-            gbuf_put(idx, e->path, plen))
+            gbuf_u64(idx, e->orig) || gbuf_u64(idx, e->data_off) ||
+            gbuf_u32(idx, (u32)plen))
             return SQUISH_E_NOMEM;
+        for (u32 b = 0; b < e->nblk; b++)
+            if (gbuf_u64(idx, e->csz[b])) return SQUISH_E_NOMEM;
+        if (gbuf_put(idx, e->path, plen)) return SQUISH_E_NOMEM;
     }
     return SQUISH_OK;
 }
 
-SQUISH_API int squish_archive_create(const char *dir_path,
-                                     const char *archive_path,
-                                     int nthreads, size_t chunk_size,
-                                     squish_progress_fn cb, void *user) {
-    if (!dir_path || !archive_path) return SQUISH_E_PARAM;
-    char *root = strip_trailing_sep(dir_path);
-    if (!root) return SQUISH_E_NOMEM;
-
-    arc_list L = { NULL, 0, 0 };
-    u64 total = 0;
-    int rc = arc_scan(root, "", &L, &total);
-    if (rc != SQUISH_OK) { arc_list_free(&L); free(root); return rc; }
-
-    FILE *f = fopen(archive_path, "wb+");
-    if (!f) { arc_list_free(&L); free(root); return SQUISH_E_IO; }
-
-    /* header placeholder: magic + version now, counts/offsets patched at end */
-    u8 hdr[SQAR_HDR];
-    memset(hdr, 0, sizeof hdr);
-    memcpy(hdr, SQAR_MAGIC, 8);
-    put_le(hdr + 8, SQAR_VERSION, 4);
-    if (fwrite(hdr, 1, SQAR_HDR, f) != SQAR_HDR) { rc = SQUISH_E_IO; goto done; }
-    u64 off = SQAR_HDR, processed = 0;
-
-    for (size_t i = 0; i < L.n; i++) {
-        arc_ent *e = &L.e[i];
-        if (e->type != 0) continue;                 /* directories: metadata only */
-        char *fs = path_join(root, e->path);
-        if (!fs) { rc = SQUISH_E_NOMEM; goto done; }
-        u8 *data; size_t dl;
-        rc = read_whole(fs, &data, &dl);
-        free(fs);
-        if (rc != SQUISH_OK) goto done;
-        void *comp; size_t cl;
-        rc = squish_compress_alloc_mt(data, dl, &comp, &cl,
-                                      nthreads, chunk_size, NULL, NULL);
-        free(data);
-        if (rc != SQUISH_OK) goto done;
-        int ok = (cl == 0) || (fwrite(comp, 1, cl, f) == cl);
-        squish_free(comp);
-        if (!ok) { rc = SQUISH_E_IO; goto done; }
-        e->coff = off; e->csize = cl; e->orig = dl;
-        off += cl;
-        processed += dl;
-        if (cb) cb(processed, total, user);
-    }
-
-    {   /* index: build, compress, append */
-        gbuf idx = { NULL, 0, 0 };
-        rc = arc_build_index(&L, &idx);
-        if (rc != SQUISH_OK) { free(idx.p); goto done; }
-        void *ic; size_t icl;
-        u8 empty = 0;
-        rc = squish_compress_alloc(idx.len ? idx.p : &empty, idx.len, &ic, &icl);
-        u64 idx_orig = idx.len;
-        free(idx.p);
-        if (rc != SQUISH_OK) goto done;
-        int ok = (icl == 0) || (fwrite(ic, 1, icl, f) == icl);
-        squish_free(ic);
-        if (!ok) { rc = SQUISH_E_IO; goto done; }
-
-        put_le(hdr + 16, (u64)L.n, 8);
-        put_le(hdr + 24, total, 8);
-        put_le(hdr + 32, off, 8);              /* index offset */
-        put_le(hdr + 40, icl, 8);              /* index compressed size */
-        put_le(hdr + 48, idx_orig, 8);         /* index original size */
-        if (sq_fseek64(f, 0) != 0 || fwrite(hdr, 1, SQAR_HDR, f) != SQAR_HDR)
-            rc = SQUISH_E_IO;
-    }
-    if (rc == SQUISH_OK && cb) cb(total, total, user);
-
-done:
-    if (fclose(f) != 0 && rc == SQUISH_OK) rc = SQUISH_E_IO;
-    if (rc != SQUISH_OK) remove(archive_path);
-    arc_list_free(&L);
-    free(root);
-    return rc;
+/* Compress `idx` (may be empty) into a single coded block, appended to *out.
+ * Sets *comp_len and *orig_len. */
+static int arc_write_index(const gbuf *idx, gbuf *out,
+                           u64 *comp_len, u64 *orig_len) {
+    size_t cap = idx->len + BLK_OVER, cl = cap;
+    u8 dummy = 0;
+    u8 *blk = (u8*)malloc(cap);
+    if (!blk) return SQUISH_E_NOMEM;
+    int rc = block_compress(idx->len ? idx->p : &dummy, idx->len, blk, cap, &cl,
+                            NULL, NULL);
+    if (rc == SQUISH_OK && gbuf_put(out, blk, cl)) rc = SQUISH_E_NOMEM;
+    free(blk);
+    if (rc != SQUISH_OK) return rc;
+    *comp_len = cl; *orig_len = idx->len;
+    return SQUISH_OK;
 }
 
-/* ---------------- reader ------------------------------------------------- */
+/* ---------------- writer core -------------------------------------------- *
+ * Layout an arc_list (dirs metadata-only; files compressed into blocks) into
+ * a growable buffer: header, member blocks, index block. Returns the archive
+ * in *out (caller frees out->p). Reads file bytes via read_whole when the
+ * entry has a filesystem source; the single-blob case pre-populates blocks. */
+
+/* Emit header into the first ARC_HDR bytes of buf. */
+static void arc_put_header(u8 *h, u32 flags, u64 entry_count, u64 total,
+                           u64 chunk, u64 index_off, u64 index_comp,
+                           u64 index_orig) {
+    memset(h, 0, ARC_HDR);
+    memcpy(h, ARC_MAGIC, 8);
+    put_le(h + 8,  ARC_VERSION, 4);
+    put_le(h + 12, flags, 4);
+    put_le(h + 16, entry_count, 8);
+    put_le(h + 24, total, 8);
+    put_le(h + 32, chunk, 8);
+    put_le(h + 40, index_off, 8);
+    put_le(h + 48, index_comp, 8);
+    put_le(h + 56, index_orig, 8);
+}
+
+/* ---------------- in-memory buffer -> one-member archive ----------------- */
+SQUISH_API int squish_compress_alloc(const void *src, size_t src_len,
+                                     void **dst, size_t *dst_len,
+                                     int nthreads, size_t chunk_size,
+                                     squish_progress_fn progress, void *user) {
+    if (!dst || !dst_len || (!src && src_len)) return SQUISH_E_PARAM;
+    *dst = NULL; *dst_len = 0;
+    if ((u64)src_len >= SQUISH_MAX_INPUT) return SQUISH_E_TOOBIG;
+    u64 chunk = eff_chunk(chunk_size);
+
+    u8 **bufs; size_t *lens; u32 k;
+    int rc = compress_member((const u8*)src, src_len, nthreads, chunk,
+                             &bufs, &lens, &k, progress, user);
+    if (rc != SQUISH_OK) return rc;
+
+    gbuf out = { NULL, 0, 0 };
+    u8 hdr[ARC_HDR];
+    memset(hdr, 0, sizeof hdr);
+    if (gbuf_put(&out, hdr, ARC_HDR)) { rc = SQUISH_E_NOMEM; goto done; }
+    u64 data_off = ARC_HDR;
+    for (u32 i = 0; i < k; i++)
+        if (gbuf_put(&out, bufs[i], lens[i])) { rc = SQUISH_E_NOMEM; goto done; }
+
+    {   /* one file entry, empty path (the unnamed blob) */
+        arc_list L = { NULL, 0, 0 };
+        char *empty = (char*)malloc(1);
+        if (!empty) { rc = SQUISH_E_NOMEM; goto done; }
+        empty[0] = '\0';
+        if (arc_list_add(&L, 0, 0, src_len, empty)) { rc = SQUISH_E_NOMEM; goto done; }
+        L.e[0].data_off = src_len ? data_off : 0;
+        L.e[0].nblk = k;
+        L.e[0].csz = (u64*)malloc(k ? k * sizeof(u64) : 1);
+        if (!L.e[0].csz) { arc_list_free(&L); rc = SQUISH_E_NOMEM; goto done; }
+        for (u32 i = 0; i < k; i++) L.e[0].csz[i] = lens[i];
+
+        gbuf idx = { NULL, 0, 0 };
+        rc = arc_build_index(&L, &idx);
+        arc_list_free(&L);
+        if (rc != SQUISH_OK) { free(idx.p); goto done; }
+        u64 index_off = out.len, icl = 0, iorig = 0;
+        rc = arc_write_index(&idx, &out, &icl, &iorig);
+        free(idx.p);
+        if (rc != SQUISH_OK) goto done;
+        arc_put_header(out.p, ARC_FLAG_SINGLE, 1, src_len, chunk,
+                       index_off, icl, iorig);
+    }
+
+done:
+    for (u32 i = 0; i < k; i++) free(bufs[i]);
+    free(bufs); free(lens);
+    if (rc != SQUISH_OK) { free(out.p); return rc; }
+    u8 *trim = (u8*)realloc(out.p, out.len ? out.len : 1);
+    *dst = trim ? trim : out.p;
+    *dst_len = out.len;
+    return SQUISH_OK;
+}
+
+/* ---------------- reader -------------------------------------------------- */
 struct squish_archive {
     FILE     *f;                 /* file-backed; NULL when memory-backed   */
     const u8 *mem; size_t mem_len;
     u64       filesize;
     u32       version, flags;
-    u64       total_size, index_off;
-    arc_ent  *ents; u64 nents;   /* coff/csize/orig/mode/type/path per member */
+    u64       total_size, chunk, index_off;
+    arc_ent  *ents; u64 nents;
 };
 
-/* Copy [off,off+len) of the archive into a fresh buffer, or (memory-backed)
- * point directly at it. *owned is set to a malloc'd buffer the caller frees,
- * or NULL when the pointer is borrowed from the mapped image. */
 static int arc_range(squish_archive *a, u64 off, u64 len,
                      const u8 **pp, u8 **owned) {
     *owned = NULL;
@@ -1532,90 +1226,134 @@ static int arc_range(squish_archive *a, u64 off, u64 len,
 
 SQUISH_API int squish_archive_probe(const void *data, size_t len) {
     const u8 *p = (const u8*)data;
-    return p && len >= 12 && memcmp(p, SQAR_MAGIC, 8) == 0 &&
-           get_le(p + 8, 4) == SQAR_VERSION;
+    return p && len >= 12 && memcmp(p, ARC_MAGIC, 8) == 0 &&
+           get_le(p + 8, 4) == ARC_VERSION;
 }
 
-/* Parse the header + decompressed index into a->ents. Returns a status. */
+SQUISH_API int squish_content_size(const void *src, size_t src_len,
+                                   uint64_t *out_size) {
+    const u8 *p = (const u8*)src;
+    if (!src || !out_size) return SQUISH_E_PARAM;
+    if (src_len < 32 || memcmp(p, ARC_MAGIC, 8) != 0 ||
+        get_le(p + 8, 4) != ARC_VERSION)
+        return SQUISH_E_FORMAT;
+    *out_size = get_le(p + 24, 8);
+    return SQUISH_OK;
+}
+
+/* Parse header + decompressed index into a->ents. Returns a status. */
 static int arc_parse(squish_archive *a) {
-    u8 hdr[SQAR_HDR];
+    u8 hdr[ARC_HDR];
     const u8 *hp;
     if (a->mem) {
-        if (a->mem_len < SQAR_HDR) return SQUISH_E_FORMAT;
+        if (a->mem_len < ARC_HDR) return SQUISH_E_FORMAT;
         hp = a->mem;
     } else {
-        if (a->filesize < SQAR_HDR) return SQUISH_E_FORMAT;
-        if (sq_fseek64(a->f, 0) != 0 || fread(hdr, 1, SQAR_HDR, a->f) != SQAR_HDR)
+        if (a->filesize < ARC_HDR) return SQUISH_E_FORMAT;
+        if (sq_fseek64(a->f, 0) != 0 || fread(hdr, 1, ARC_HDR, a->f) != ARC_HDR)
             return SQUISH_E_IO;
         hp = hdr;
     }
-    if (memcmp(hp, SQAR_MAGIC, 8) != 0 || get_le(hp + 8, 4) != SQAR_VERSION)
+    if (memcmp(hp, ARC_MAGIC, 8) != 0 || get_le(hp + 8, 4) != ARC_VERSION)
         return SQUISH_E_FORMAT;
     a->version    = (u32)get_le(hp + 8, 4);
     a->flags      = (u32)get_le(hp + 12, 4);
     u64 count     = get_le(hp + 16, 8);
     a->total_size = get_le(hp + 24, 8);
-    a->index_off  = get_le(hp + 32, 8);
-    u64 icl       = get_le(hp + 40, 8);
-    u64 iorig     = get_le(hp + 48, 8);
+    a->chunk      = get_le(hp + 32, 8);
+    a->index_off  = get_le(hp + 40, 8);
+    u64 icl       = get_le(hp + 48, 8);
+    u64 iorig     = get_le(hp + 56, 8);
 
-    /* index blob must sit wholly after the header and inside the file */
-    if (a->index_off < SQAR_HDR || icl > a->filesize - a->index_off)
+    if (a->chunk < 1) return SQUISH_E_FORMAT;
+    /* index block must sit wholly after the header and inside the file */
+    if (a->index_off < ARC_HDR || icl > a->filesize - a->index_off)
         return SQUISH_E_FORMAT;
-    /* every entry costs at least SQAR_ENT_FIXED + 1 bytes, so this bounds the
+    /* every entry costs at least ARC_ENT_FIXED bytes, so this bounds the
      * index allocation against a forged count */
-    if (iorig >= SQUISH_MAX_INPUT || count > iorig / (SQAR_ENT_FIXED + 1))
+    if (iorig >= SQUISH_MAX_INPUT || count > iorig / ARC_ENT_FIXED)
         return SQUISH_E_FORMAT;
 
     const u8 *ip; u8 *iown;
     int rc = arc_range(a, a->index_off, icl, &ip, &iown);
     if (rc != SQUISH_OK) return rc;
-    void *idx = NULL; size_t idn = 0;
-    rc = squish_decompress_alloc(ip, (size_t)icl, &idx, &idn);
+    u8 *idx = (u8*)malloc(iorig ? (size_t)iorig : 1);
+    if (!idx) { free(iown); return SQUISH_E_NOMEM; }
+    rc = block_decompress(ip, (size_t)icl, idx, (size_t)iorig, NULL, NULL);
     free(iown);
-    if (rc != SQUISH_OK) return rc == SQUISH_E_CHECKSUM ? SQUISH_E_FORMAT : rc;
-    if (idn != iorig) { squish_free(idx); return SQUISH_E_FORMAT; }
+    if (rc != SQUISH_OK) { free(idx); return rc == SQUISH_E_CHECKSUM ? SQUISH_E_FORMAT : rc; }
 
     a->ents = (arc_ent*)calloc(count ? (size_t)count : 1, sizeof(arc_ent));
-    if (!a->ents) { squish_free(idx); return SQUISH_E_NOMEM; }
+    if (!a->ents) { free(idx); return SQUISH_E_NOMEM; }
 
-    const u8 *b = (const u8*)idx;
-    size_t o = 0;
+    const u8 *b = idx;
+    size_t o = 0, idn = (size_t)iorig;
     rc = SQUISH_OK;
     for (u64 i = 0; i < count; i++) {
-        if (idn - o < SQAR_ENT_FIXED) { rc = SQUISH_E_FORMAT; break; }
+        if (idn - o < ARC_ENT_FIXED) { rc = SQUISH_E_FORMAT; break; }
         arc_ent *e = &a->ents[i];
-        e->type  = b[o];
-        e->mode  = (u32)get_le(b + o + 1, 4);
-        e->orig  = get_le(b + o + 5, 8);
-        e->coff  = get_le(b + o + 13, 8);
-        e->csize = get_le(b + o + 21, 8);
-        u32 plen = (u32)get_le(b + o + 29, 4);
-        o += SQAR_ENT_FIXED;
-        if (plen == 0 || plen > SQAR_MAX_PATH || plen > idn - o) { rc = SQUISH_E_FORMAT; break; }
-        if (!arc_path_safe((const char*)(b + o), plen)) { rc = SQUISH_E_FORMAT; break; }
-        e->path = (char*)malloc((size_t)plen + 1);
-        if (!e->path) { rc = SQUISH_E_NOMEM; break; }
-        memcpy(e->path, b + o, plen); e->path[plen] = '\0';
-        o += plen;
-        a->nents = i + 1;                       /* so cleanup frees this path */
-        if (e->type == 1) {
-            if (e->orig || e->coff || e->csize) { rc = SQUISH_E_FORMAT; break; }
-        } else if (e->type == 0) {
-            /* member stream must lie inside the data region [HDR, index_off) */
-            if (e->coff < SQAR_HDR || e->csize > a->index_off - e->coff ||
-                e->csize < OVERHEAD) { rc = SQUISH_E_FORMAT; break; }
+        e->type     = b[o];
+        e->mode     = (u32)get_le(b + o + 1, 4);
+        e->orig     = get_le(b + o + 5, 8);
+        e->data_off = get_le(b + o + 13, 8);
+        u32 plen    = (u32)get_le(b + o + 21, 4);
+        o += ARC_ENT_FIXED;
+        a->nents = i + 1;                       /* so cleanup frees this entry */
+
+        if (e->type == 1) {                    /* directory */
+            if (e->orig || e->data_off) { rc = SQUISH_E_FORMAT; break; }
+            e->nblk = 0; e->csz = NULL;
+        } else if (e->type == 0) {             /* regular file */
+            if (e->orig >= SQUISH_MAX_INPUT) { rc = SQUISH_E_FORMAT; break; }
+            u64 nb = member_blocks(e->orig, a->chunk);
+            if (nb > MAX_BLOCKS) { rc = SQUISH_E_FORMAT; break; }
+            e->nblk = (u32)nb;
+            if (nb) {
+                if ((idn - o) / 8 < nb) { rc = SQUISH_E_FORMAT; break; }
+                e->csz = (u64*)malloc((size_t)nb * sizeof(u64));
+                if (!e->csz) { rc = SQUISH_E_NOMEM; break; }
+                u64 span = 0;
+                for (u32 bi = 0; bi < nb; bi++) {
+                    e->csz[bi] = get_le(b + o, 8); o += 8;
+                    if (e->csz[bi] < BLK_OVER) { rc = SQUISH_E_FORMAT; break; }
+                    span += e->csz[bi];
+                }
+                if (rc != SQUISH_OK) break;
+                /* member blocks must lie inside the data region [HDR, index) */
+                if (e->data_off < ARC_HDR || span > a->index_off - e->data_off) {
+                    rc = SQUISH_E_FORMAT; break;
+                }
+            } else {
+                e->csz = NULL;
+                if (e->data_off) { rc = SQUISH_E_FORMAT; break; }
+            }
         } else { rc = SQUISH_E_FORMAT; break; }
+
+        if (plen > idn - o) { rc = SQUISH_E_FORMAT; break; }
+        /* empty path allowed only for a lone unnamed blob member */
+        if (plen == 0) {
+            if (!(count == 1 && e->type == 0)) { rc = SQUISH_E_FORMAT; break; }
+            e->path = (char*)malloc(1); if (e->path) e->path[0] = '\0';
+        } else {
+            if (plen > ARC_MAX_PATH ||
+                !arc_path_safe((const char*)(b + o), plen)) { rc = SQUISH_E_FORMAT; break; }
+            e->path = (char*)malloc((size_t)plen + 1);
+            if (e->path) { memcpy(e->path, b + o, plen); e->path[plen] = '\0'; }
+        }
+        if (!e->path) { rc = SQUISH_E_NOMEM; break; }
+        o += plen;
     }
     if (rc == SQUISH_OK && o != idn) rc = SQUISH_E_FORMAT;   /* must tile */
-    squish_free(idx);
+    free(idx);
     return rc;
 }
 
 static void arc_reader_free(squish_archive *a) {
     if (!a) return;
     if (a->f) fclose(a->f);
-    if (a->ents) for (u64 i = 0; i < a->nents; i++) free(a->ents[i].path);
+    if (a->ents) for (u64 i = 0; i < a->nents; i++) {
+        free(a->ents[i].path); free(a->ents[i].csz);
+    }
     free(a->ents);
     free(a);
 }
@@ -1657,11 +1395,18 @@ SQUISH_API int squish_archive_info_get(const squish_archive *a,
     if (!a || !out) return SQUISH_E_PARAM;
     out->version = a->version; out->flags = a->flags;
     out->entry_count = a->nents; out->total_size = a->total_size;
+    out->chunk_size = a->chunk;
     return SQUISH_OK;
 }
 
 SQUISH_API uint64_t squish_archive_count(const squish_archive *a) {
     return a ? a->nents : 0;
+}
+
+static u64 ent_stored(const arc_ent *e) {
+    u64 s = 0;
+    for (u32 i = 0; i < e->nblk; i++) s += e->csz[i];
+    return s;
 }
 
 SQUISH_API int squish_archive_stat(const squish_archive *a, uint64_t index,
@@ -1670,7 +1415,7 @@ SQUISH_API int squish_archive_stat(const squish_archive *a, uint64_t index,
     const arc_ent *e = &a->ents[index];
     out->path = e->path;
     out->size = e->orig;
-    out->stored_size = e->csize;
+    out->stored_size = ent_stored(e);
     out->mode = e->mode;
     out->is_dir = (e->type == 1);
     return SQUISH_OK;
@@ -1689,23 +1434,33 @@ SQUISH_API int squish_archive_find(const squish_archive *a,
     return SQUISH_E_FORMAT;
 }
 
-SQUISH_API int squish_archive_extract(squish_archive *a, uint64_t index,
-                                      void **out, size_t *out_len) {
-    if (!a || !out || !out_len) return SQUISH_E_PARAM;
+/* Extract member `index` into a fresh buffer. Shared by the public extract
+ * calls and the single-member decompress helpers. */
+static int arc_extract_idx(squish_archive *a, u64 index, int nthreads,
+                           void **out, size_t *out_len,
+                           squish_progress_fn cb, void *user) {
     *out = NULL; *out_len = 0;
     if (index >= a->nents) return SQUISH_E_PARAM;
     const arc_ent *e = &a->ents[index];
-    if (e->type != 0) return SQUISH_E_PARAM;            /* directory */
+    if (e->type != 0) return SQUISH_E_PARAM;           /* directory */
+    u64 span = ent_stored(e);
     const u8 *cp; u8 *own;
-    int rc = arc_range(a, e->coff, e->csize, &cp, &own);
+    int rc = arc_range(a, e->data_off, span, &cp, &own);
     if (rc != SQUISH_OK) return rc;
-    void *dec; size_t dn;
-    rc = squish_decompress_alloc_mt(cp, (size_t)e->csize, &dec, &dn, 0, NULL, NULL);
+    u8 *dec = (u8*)malloc(e->orig ? (size_t)e->orig : 1);
+    if (!dec) { free(own); return SQUISH_E_NOMEM; }
+    rc = decompress_member(cp, span, e->csz, e->nblk, e->orig, a->chunk, dec,
+                           nthreads, cb, user);
     free(own);
-    if (rc != SQUISH_OK) return rc;
-    if (dn != e->orig) { squish_free(dec); return SQUISH_E_FORMAT; }
-    *out = dec; *out_len = dn;
+    if (rc != SQUISH_OK) { free(dec); return rc; }
+    *out = dec; *out_len = (size_t)e->orig;
     return SQUISH_OK;
+}
+
+SQUISH_API int squish_archive_extract(squish_archive *a, uint64_t index,
+                                      void **out, size_t *out_len) {
+    if (!a || !out || !out_len) return SQUISH_E_PARAM;
+    return arc_extract_idx(a, index, 0, out, out_len, NULL, NULL);
 }
 
 SQUISH_API int squish_archive_extract_path(squish_archive *a, const char *path,
@@ -1715,7 +1470,7 @@ SQUISH_API int squish_archive_extract_path(squish_archive *a, const char *path,
     uint64_t i;
     int rc = squish_archive_find(a, path, &i);
     if (rc != SQUISH_OK) return rc;
-    return squish_archive_extract(a, i, out, out_len);
+    return arc_extract_idx(a, i, 0, out, out_len, NULL, NULL);
 }
 
 SQUISH_API int squish_archive_extract_to_file(squish_archive *a,
@@ -1727,7 +1482,7 @@ SQUISH_API int squish_archive_extract_to_file(squish_archive *a,
     if (rc != SQUISH_OK) return rc;
     if (a->ents[i].type != 0) return SQUISH_E_PARAM;
     void *buf; size_t n;
-    rc = squish_archive_extract(a, i, &buf, &n);
+    rc = arc_extract_idx(a, i, 0, &buf, &n, NULL, NULL);
     if (rc != SQUISH_OK) return rc;
     rc = write_file_bytes(dst_path, (const u8*)buf, n, a->ents[i].mode) == 0
              ? SQUISH_OK : SQUISH_E_IO;
@@ -1735,7 +1490,6 @@ SQUISH_API int squish_archive_extract_to_file(squish_archive *a,
     return rc;
 }
 
-/* True if member path `p` is `prefix` itself or lies beneath it. */
 static int under_prefix(const char *p, const char *prefix, size_t plen) {
     if (plen == 0) return 1;
     if (strncmp(p, prefix, plen) != 0) return 0;
@@ -1747,12 +1501,12 @@ SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
                                               const char *dst_root,
                                               squish_progress_fn cb, void *user) {
     if (!a || !dst_root) return SQUISH_E_PARAM;
-    char pbuf[SQAR_MAX_PATH + 1];
+    char pbuf[ARC_MAX_PATH + 1];
     size_t plen = 0;
     if (prefix && *prefix) {
         plen = strlen(prefix);
         while (plen > 1 && prefix[plen-1] == '/') plen--;
-        if (plen > SQAR_MAX_PATH) return SQUISH_E_FORMAT;
+        if (plen > ARC_MAX_PATH) return SQUISH_E_FORMAT;
         memcpy(pbuf, prefix, plen); pbuf[plen] = '\0';
     }
     const char *pfx = plen ? pbuf : "";
@@ -1760,7 +1514,7 @@ SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
     u64 total = 0, processed = 0;
     int matched = 0;
     for (u64 i = 0; i < a->nents; i++)
-        if (under_prefix(a->ents[i].path, pfx, plen)) {
+        if (a->ents[i].path[0] && under_prefix(a->ents[i].path, pfx, plen)) {
             matched = 1;
             if (a->ents[i].type == 0) total += a->ents[i].orig;
         }
@@ -1770,14 +1524,14 @@ SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
     int rc = SQUISH_OK;
     for (u64 i = 0; i < a->nents && rc == SQUISH_OK; i++) {
         const arc_ent *e = &a->ents[i];
-        if (!under_prefix(e->path, pfx, plen)) continue;
+        if (!e->path[0] || !under_prefix(e->path, pfx, plen)) continue;
         if (e->type == 1) {
             if (make_dirs(dst_root, e->path, 1) != 0) rc = SQUISH_E_IO;
         } else {
             char *full = path_join(dst_root, e->path);
             if (!full) { rc = SQUISH_E_NOMEM; break; }
             void *buf; size_t n;
-            rc = squish_archive_extract(a, i, &buf, &n);
+            rc = arc_extract_idx(a, i, 0, &buf, &n, NULL, NULL);
             if (rc == SQUISH_OK) {
                 if (make_dirs(dst_root, e->path, 0) != 0 ||
                     write_file_bytes(full, (const u8*)buf, n, e->mode) != 0)
@@ -1789,5 +1543,241 @@ SQUISH_API int squish_archive_extract_subtree(squish_archive *a,
             free(full);
         }
     }
+    return rc;
+}
+
+/* ---------------- directory -> archive ----------------------------------- */
+
+/* Walk fs_dir, appending each member (dirs before their contents, siblings
+ * sorted) to L with archive-relative path arc_pre/<name>; sum file sizes into
+ * *total. Does not read file contents. */
+static int arc_scan(const char *fs_dir, const char *arc_pre,
+                    arc_list *L, u64 *total) {
+    char **names; size_t n;
+    if (list_dir(fs_dir, &names, &n) != 0) return SQUISH_E_IO;
+    int rc = SQUISH_OK;
+    for (size_t i = 0; i < n && rc == SQUISH_OK; i++) {
+        char *fs  = path_join(fs_dir, names[i]);
+        char *arc = path_join(arc_pre, names[i]);
+        if (!fs || !arc) { free(fs); free(arc); rc = SQUISH_E_NOMEM; break; }
+        if (strlen(arc) > ARC_MAX_PATH) { free(fs); free(arc); rc = SQUISH_E_FORMAT; break; }
+        if (path_is_dir(fs)) {
+            if (arc_list_add(L, 1, path_mode(fs, 0755), 0, arc) != 0) {
+                rc = SQUISH_E_NOMEM;
+            } else {
+                rc = arc_scan(fs, L->e[L->n - 1].path, L, total);
+            }
+        } else if (path_is_regular(fs)) {
+            u64 sz = path_size(fs);
+            if (arc_list_add(L, 0, path_mode(fs, 0644), sz, arc) != 0) rc = SQUISH_E_NOMEM;
+            else *total += sz;
+        } else {
+            free(arc);      /* skip sockets/fifos/dangling links */
+        }
+        free(fs);
+    }
+    free_names(names, n);
+    return rc;
+}
+
+SQUISH_API int squish_archive_create(const char *dir_path,
+                                     const char *archive_path,
+                                     int nthreads, size_t chunk_size,
+                                     squish_progress_fn cb, void *user) {
+    if (!dir_path || !archive_path) return SQUISH_E_PARAM;
+    char *root = strip_trailing_sep(dir_path);
+    if (!root) return SQUISH_E_NOMEM;
+    u64 chunk = eff_chunk(chunk_size);
+
+    arc_list L = { NULL, 0, 0 };
+    u64 total = 0;
+    int rc = arc_scan(root, "", &L, &total);
+    if (rc != SQUISH_OK) { arc_list_free(&L); free(root); return rc; }
+
+    FILE *f = fopen(archive_path, "wb+");
+    if (!f) { arc_list_free(&L); free(root); return SQUISH_E_IO; }
+
+    u8 hdr[ARC_HDR];
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, ARC_MAGIC, 8);
+    put_le(hdr + 8, ARC_VERSION, 4);
+    if (fwrite(hdr, 1, ARC_HDR, f) != ARC_HDR) { rc = SQUISH_E_IO; goto done; }
+    u64 off = ARC_HDR, processed = 0;
+
+    for (size_t i = 0; i < L.n; i++) {
+        arc_ent *e = &L.e[i];
+        if (e->type != 0) continue;                 /* directories: metadata only */
+        char *fs = path_join(root, e->path);
+        if (!fs) { rc = SQUISH_E_NOMEM; goto done; }
+        u8 *data; size_t dl;
+        rc = read_whole(fs, &data, &dl);
+        free(fs);
+        if (rc != SQUISH_OK) goto done;
+
+        u8 **bufs; size_t *lens; u32 k;
+        rc = compress_member(data, dl, nthreads, chunk, &bufs, &lens, &k, NULL, NULL);
+        free(data);
+        if (rc != SQUISH_OK) goto done;
+
+        e->data_off = dl ? off : 0;
+        e->orig = dl;
+        e->nblk = k;
+        e->csz = (u64*)malloc(k ? k * sizeof(u64) : 1);
+        if (!e->csz) { for (u32 j=0;j<k;j++) free(bufs[j]); free(bufs); free(lens);
+                       rc = SQUISH_E_NOMEM; goto done; }
+        int ok = 1;
+        for (u32 j = 0; j < k; j++) {
+            e->csz[j] = lens[j];
+            if (fwrite(bufs[j], 1, lens[j], f) != lens[j]) ok = 0;
+            free(bufs[j]);
+            off += lens[j];
+        }
+        free(bufs); free(lens);
+        if (!ok) { rc = SQUISH_E_IO; goto done; }
+        processed += dl;
+        if (cb) cb(processed, total, user);
+    }
+
+    {   /* index: build, compress into one block, append */
+        gbuf idx = { NULL, 0, 0 };
+        rc = arc_build_index(&L, &idx);
+        if (rc != SQUISH_OK) { free(idx.p); goto done; }
+        gbuf iblk = { NULL, 0, 0 };
+        u64 icl = 0, iorig = 0;
+        rc = arc_write_index(&idx, &iblk, &icl, &iorig);
+        free(idx.p);
+        if (rc != SQUISH_OK) { free(iblk.p); goto done; }
+        int ok = (iblk.len == 0) || (fwrite(iblk.p, 1, iblk.len, f) == iblk.len);
+        free(iblk.p);
+        if (!ok) { rc = SQUISH_E_IO; goto done; }
+
+        arc_put_header(hdr, 0, (u64)L.n, total, chunk, off, icl, iorig);
+        if (sq_fseek64(f, 0) != 0 || fwrite(hdr, 1, ARC_HDR, f) != ARC_HDR)
+            rc = SQUISH_E_IO;
+    }
+    if (rc == SQUISH_OK && cb) cb(total, total, user);
+
+done:
+    if (fclose(f) != 0 && rc == SQUISH_OK) rc = SQUISH_E_IO;
+    if (rc != SQUISH_OK) remove(archive_path);
+    arc_list_free(&L);
+    free(root);
+    return rc;
+}
+
+/* ---------------- in-memory archive -> buffer (single member) ------------ */
+SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
+                                       void **dst, size_t *dst_len,
+                                       int nthreads,
+                                       squish_progress_fn progress, void *user) {
+    if (!dst || !dst_len) return SQUISH_E_PARAM;
+    *dst = NULL; *dst_len = 0;
+    squish_archive *a;
+    int rc = squish_archive_open_memory(src, src_len, &a);
+    if (rc != SQUISH_OK) return rc;
+    /* exactly one regular-file member */
+    u64 fi = 0, nf = 0;
+    for (u64 i = 0; i < a->nents; i++)
+        if (a->ents[i].type == 0) { fi = i; nf++; }
+    if (nf != 1) { squish_archive_close(a); return SQUISH_E_FORMAT; }
+    rc = arc_extract_idx(a, fi, nthreads, dst, dst_len, progress, user);
+    squish_archive_close(a);
+    return rc;
+}
+
+/* ---------------- whole-file helpers ------------------------------------- */
+
+/* Last path component, no directory/drive prefix; never empty. */
+static const char *base_name(const char *name) {
+    const char *b = name;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\' || *p == ':') b = p + 1;
+    return (*b && strcmp(b, ".") && strcmp(b, "..")) ? b : "data";
+}
+
+SQUISH_API int squish_compress_file(const char *src_path, const char *dst_path,
+                                    int nthreads, size_t chunk_size,
+                                    squish_progress_fn progress, void *user) {
+    if (!src_path || !dst_path) return SQUISH_E_PARAM;
+    u8 *in; size_t n;
+    int rc = read_whole(src_path, &in, &n);
+    if (rc != SQUISH_OK) return rc;
+    u64 chunk = eff_chunk(chunk_size);
+
+    u8 **bufs; size_t *lens; u32 k;
+    rc = compress_member(in, n, nthreads, chunk, &bufs, &lens, &k, progress, user);
+    free(in);
+    if (rc != SQUISH_OK) return rc;
+
+    FILE *f = fopen(dst_path, "wb+");
+    if (!f) { for (u32 i=0;i<k;i++) free(bufs[i]); free(bufs); free(lens);
+              return SQUISH_E_IO; }
+
+    u8 hdr[ARC_HDR];
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, ARC_MAGIC, 8); put_le(hdr + 8, ARC_VERSION, 4);
+    int ok = fwrite(hdr, 1, ARC_HDR, f) == ARC_HDR;
+    u64 data_off = ARC_HDR, off = ARC_HDR;
+    for (u32 i = 0; i < k && ok; i++) {
+        if (fwrite(bufs[i], 1, lens[i], f) != lens[i]) ok = 0;
+        off += lens[i];
+    }
+    for (u32 i = 0; i < k; i++) free(bufs[i]);
+    if (!ok) { free(bufs); free(lens); fclose(f); remove(dst_path); return SQUISH_E_IO; }
+
+    {   /* one named file entry */
+        arc_list L = { NULL, 0, 0 };
+        const char *bn = base_name(src_path);
+        size_t bl = strlen(bn);
+        char *nm = (char*)malloc(bl + 1);
+        if (!nm) { free(bufs); free(lens); fclose(f); remove(dst_path); return SQUISH_E_NOMEM; }
+        memcpy(nm, bn, bl + 1);
+        if (arc_list_add(&L, 0, 0644, n, nm)) { free(bufs); free(lens); fclose(f); remove(dst_path); return SQUISH_E_NOMEM; }
+        L.e[0].data_off = n ? data_off : 0;
+        L.e[0].nblk = k;
+        L.e[0].csz = (u64*)malloc(k ? k * sizeof(u64) : 1);
+        if (!L.e[0].csz) { arc_list_free(&L); free(bufs); free(lens); fclose(f); remove(dst_path); return SQUISH_E_NOMEM; }
+        for (u32 i = 0; i < k; i++) L.e[0].csz[i] = lens[i];
+        free(bufs); free(lens);
+
+        gbuf idx = { NULL, 0, 0 };
+        rc = arc_build_index(&L, &idx);
+        arc_list_free(&L);
+        if (rc != SQUISH_OK) { free(idx.p); fclose(f); remove(dst_path); return rc; }
+        gbuf iblk = { NULL, 0, 0 };
+        u64 icl = 0, iorig = 0;
+        rc = arc_write_index(&idx, &iblk, &icl, &iorig);
+        free(idx.p);
+        if (rc != SQUISH_OK) { free(iblk.p); fclose(f); remove(dst_path); return rc; }
+        ok = (iblk.len == 0) || (fwrite(iblk.p, 1, iblk.len, f) == iblk.len);
+        free(iblk.p);
+        if (ok) {
+            arc_put_header(hdr, ARC_FLAG_SINGLE, 1, n, chunk, off, icl, iorig);
+            if (sq_fseek64(f, 0) != 0 || fwrite(hdr, 1, ARC_HDR, f) != ARC_HDR) ok = 0;
+        }
+    }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(dst_path); return SQUISH_E_IO; }
+    return SQUISH_OK;
+}
+
+SQUISH_API int squish_decompress_file(const char *src_path, const char *dst_path,
+                                      int nthreads,
+                                      squish_progress_fn progress, void *user) {
+    if (!src_path || !dst_path) return SQUISH_E_PARAM;
+    squish_archive *a;
+    int rc = squish_archive_open(src_path, &a);
+    if (rc != SQUISH_OK) return rc;
+    u64 fi = 0, nf = 0;
+    for (u64 i = 0; i < a->nents; i++)
+        if (a->ents[i].type == 0) { fi = i; nf++; }
+    if (nf != 1) { squish_archive_close(a); return SQUISH_E_FORMAT; }
+    void *buf; size_t n;
+    rc = arc_extract_idx(a, fi, nthreads, &buf, &n, progress, user);
+    squish_archive_close(a);
+    if (rc != SQUISH_OK) return rc;
+    rc = write_file_bytes(dst_path, (const u8*)buf, n, 0) == 0
+             ? SQUISH_OK : SQUISH_E_IO;
+    squish_free(buf);
     return rc;
 }

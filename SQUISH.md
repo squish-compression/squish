@@ -67,44 +67,42 @@ There is no dictionary, no block structure, no Huffman tables in the format:
 
 ## Format
 
-`"SQ02"` magic · u64 LE original size · mode byte (coded/stored) ·
-payload · 32-bit checksum of the original data. Incompressible inputs fall
-back to stored mode, so output never exceeds input + 17 bytes; decompression
-verifies the checksum. Full byte-level spec: [docs/FORMAT.md](docs/FORMAT.md).
+There is one on-disk format, the **SQUISH archive** (magic `"SQSH"`): a header,
+one compressed member per file, and a compressed index of paths and per-file
+block layout. A member's bytes are one or more **coded blocks**, each a mode
+byte (coded/stored) · payload · 32-bit checksum of the block's original data.
+Incompressible data falls back to stored blocks, so output stays close to
+input; decompression verifies every block's checksum. A lone file or buffer is
+just a one-member archive. Full byte-level spec: [docs/FORMAT.md](docs/FORMAT.md).
 
-The model pipeline is strictly sequential within a stream — every bit's
-prediction depends on the previous bit's update — so multi-core operation
-comes from cutting the input into chunks instead: an `"SQ01"` multi-block
-container wraps independent `SQ02` chunk streams that compress and
-decompress in parallel (`squish -t`, `squish_*_mt`), trading ~1–2% of
-ratio for near-linear speedup.
-
-Directories use a third container, `"SQAR02"`: a header, one `SQ02`/`SQ01`
-stream per file, and a compressed index of paths and offsets, so a single
-file or subtree can be extracted by seeking to just its stream instead of
-inflating the whole archive.
+The model pipeline is strictly sequential within a block — every bit's
+prediction depends on the previous bit's update — so multi-core operation comes
+from cutting a member into fixed-size blocks: independent blocks compress and
+decompress in parallel (`squish -t`), trading ~1–2% of ratio for near-linear
+speedup. Because the archive index records each member's block layout, a reader
+can seek straight to any member, or any block of it, without touching the rest.
 
 ## Usage
 
 ```
-make                            # libsquish.so + squish CLI
-./squish c input output.sq      # compress a file (or a directory tree)
-./squish d output.sq restored   # decompress (checksum-verified)
-./squish l archive.sqar         # list an archive's contents
-./squish x archive.sqar a/b.txt # extract one file (or subtree) from an archive
+make                              # libsquish.so + squish CLI
+./squish c input output.sqsh      # compress a file (or a directory tree)
+./squish d output.sqsh restored   # decompress (checksum-verified)
+./squish l archive.sqsh           # list an archive's contents
+./squish x archive.sqsh a/b.txt   # extract one file (or subtree) from an archive
 ```
 
-`input` may be a directory: it is packed into a **seekable `SQAR` archive**,
-each file its own stream, so `l` lists the contents and `x` pulls out a single
-file or subtree without inflating the rest; `d` recreates the whole tree under
-`restored`. Single files are compressed exactly as before. The same operations
-are available to library consumers through the `squish_archive_*` API. See
-[docs/FORMAT.md](docs/FORMAT.md) §12 and [docs/API.md](docs/API.md).
+`input` may be a file or a directory; either way `output` is a SQUISH archive,
+each file its own member, so `l` lists the contents and `x` pulls out a single
+file or subtree without inflating the rest; `d` restores a single file or
+recreates a whole tree under `restored`. The same operations are available to
+library consumers through the `squish_archive_*` API. See
+[docs/FORMAT.md](docs/FORMAT.md) and [docs/API.md](docs/API.md).
 
 SQUISH is also a library — `squish.h` + `libsquish.so` (or `make dll` for
 Windows); see [docs/API.md](docs/API.md) and `examples/`.
 
-Memory: ~150 MB of model state per stream + buffers. Speed: ~0.5–0.7 MB/s,
+Memory: ~150 MB of model state per active block + buffers. Speed: ~0.5–0.7 MB/s,
 symmetric (decompression runs the same models). That is the honest trade:
 SQUISH spends CPU that zip/bzip2/rar don't, and buys ratio with it.
 

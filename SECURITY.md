@@ -41,11 +41,11 @@ security issues, not just correctness bugs.
 
 Callers feeding untrusted streams to the `*_alloc`/file helpers should know:
 
-- The output allocation is controlled by the stream header, up to the
-  format limit of 4 GiB − 16 bytes. Check `squish_decompressed_size()`
+- The output allocation is controlled by the archive header, up to the
+  format limit of 4 GiB − 16 bytes per member. Check `squish_content_size()`
   first and refuse sizes your application cannot afford.
-- Model state costs ~150 MB per active (de)compression — times the thread
-  count for the `_mt` functions.
+- Model state costs ~150 MB per active block — times the thread count when
+  `nthreads` splits a member across cores.
 - Context mixing has no compression-ratio ceiling, so a tiny valid stream
   legitimately expanding to gigabytes (e.g. compressed zeros) cannot be
   distinguished from a bomb by ratio alone; the size pre-check above is the

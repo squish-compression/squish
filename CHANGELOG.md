@@ -9,81 +9,38 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ## [Unreleased]
 
-### Added
-
-- Seekable directory archives (`SQAR02`) and a library archive API. A
-  directory is now packed so that each file is compressed as its **own**
-  stream, behind a header and a compressed index of paths and offsets — so a
-  reader can view the header, list members, and inflate a single file or
-  subtree by seeking straight to it, without decompressing the rest of the
-  archive. New in `squish.h`: `squish_archive_create`, `squish_archive_open` /
-  `_open_memory` / `_close`, `_probe`, `_info_get`, `_count`, `_stat`, `_find`,
-  `_extract` / `_extract_path` / `_extract_to_file`, and `_extract_subtree`,
-  plus the `squish_archive`, `squish_archive_info`, and `squish_archive_entry`
-  types. All archive logic now lives in libsquish (previously CLI-only), so
-  DLL/SO consumers get it too. Directories, empty directories, and unix
-  permission bits are preserved; members are stored sorted (reproducible), and
-  extraction rejects absolute paths and `..` traversal. Single-file
-  compression is unchanged and byte-for-byte compatible with earlier releases.
-  See docs/FORMAT.md §12 and docs/API.md.
-- CLI: directory operations for `c`, `d`, `l`, `x`, and `s`. `squish c <dir>`
-  builds a seekable `SQAR` archive; `squish l <archive>` lists it; `squish x
-  <archive> <member> [dest]` extracts one file or subtree without touching the
-  rest; `squish d` extracts the whole tree (auto-detecting an archive vs. a
-  plain stream); `squish s` packs a directory into a self-extracting executable
-  (the stub sniffs the payload to tell an archive from a single-file stream).
-- CLI: `s` command — build a self-extracting archive. `squish s input output`
-  compresses `input` and appends it (plus the original name and a 32-byte
-  trailer) to a copy of the `squish` CLI used as a stub; the resulting
-  executable restores the file when run, with no `squish` or `libsquish`
-  installed, and checksum-verifies it. Running an archive takes `-f`
-  (overwrite), `-q`, `-t`, and an optional output path; build takes the same
-  `-t`/`-b`/`-q` as `c`. Extraction sanitizes the stored name to a basename,
-  so an archive never writes outside the target directory. The archive is
-  platform-specific (the stub is the host's CLI); see docs/FORMAT.md §11.
-- Multi-threaded compression and decompression: new `SQ01` multi-block
-  container (independent `SQ02` chunk streams; see docs/FORMAT.md §1b) and
-  library functions `squish_compress_mt` / `squish_decompress_mt`, their
-  `_alloc_mt` / `_file_mt` variants, and `squish_threads()`. Output depends
-  only on the chunk size (default 16 MiB), never on the thread count, and
-  the `squish_compress_bound` guarantee is preserved. Existing
-  decompression entry points read `SQ01` streams transparently. (The
-  `SQ01` magic previously named an unreleased pre-1.0 draft no reader
-  accepted; it has been reassigned to the multi-block container.)
-- CLI: `-t N` / `--threads N` — 0 = all cores; compression defaults to 1,
-  keeping the ratio-optimal single-block format, decompression to all
-  cores — and `-b N` / `--block N` block size in MiB for `-t`
-- CLI: live status line on stderr (percent, bytes, throughput) while
-  compressing/decompressing when stderr is a terminal; `-q`/`--quiet`
-  suppresses the status line and the final summary (errors still print)
-- Library: `squish_progress_fn` callback type and progress-reporting file
-  helpers `squish_compress_file2` / `squish_decompress_file2` (additive;
-  existing functions unchanged)
-- `build-windows.bat`: builds `squish.dll` + `squish.exe` with MSVC from a
-  plain command prompt (locates Visual Studio via vswhere; no make needed)
-
-### Fixed
-
-- Undefined behavior: `memcpy` was called with a NULL pointer and length 0
-  when compressing empty input (`src == NULL, src_len == 0`, stored mode)
-  or decompressing an empty stored stream to a NULL destination; caught by
-  UBSan, now guarded
-- `squish_decompressed_size` now rejects headers claiming sizes at or above
-  `SQUISH_MAX_INPUT` (impossible for a valid stream) with
-  `SQUISH_E_FORMAT` instead of returning them, hardening callers that size
-  allocations from untrusted headers
-
 ### Changed
 
-- CLI: the status line and summary now measure throughput on a wall clock
-  (was CPU time, which over-counts when threads are in play)
-- Build: the MSVC `squish.exe` (`make windows-dll`, `build-windows.bat`) now
-  links libsquish statically instead of against `squish.dll`, matching the
-  mingw `make dll` build. This makes `squish.exe` stand alone, which the new
-  `s` command requires (an archive copies the CLI as its stub). `squish.dll`
-  is still built for library consumers.
-- Building now requires a threads library: `-pthread` outside Windows
-  (added to the Makefile and pkg-config file), Win32 threads on Windows
+- **One on-disk format.** Everything SQUISH writes is now a single seekable
+  **SQUISH archive** (magic `SQSH`, version 1; see docs/FORMAT.md). A file or a
+  memory buffer is a one-member archive; a directory is a many-member archive.
+  This replaces the four pre-release formats — the `SQ02` single stream, the
+  `SQ01` multi-block stream, and the `SQAR01`/`SQAR02` directory archives — with
+  one container. Its atom is a coded **block** (`mode + payload + checksum`, no
+  magic or length — the archive index frames it); a member's data is a list of
+  blocks (chunked for parallelism), so big members still (de)compress on all
+  cores and a reader still seeks straight to any member or block. None of these
+  formats had shipped, so nothing on disk needs migrating.
+- **Streamlined library API.** Parallelism is folded into the core functions via
+  `nthreads`/`chunk_size` parameters rather than separate `_mt` entry points.
+  `squish_compress_alloc` / `squish_decompress_alloc` now take
+  `(nthreads, chunk_size, progress, user)` and produce/consume a one-member
+  archive; `squish_compress_file` / `squish_decompress_file` likewise. New
+  `squish_content_size` (reads the archive's uncompressed size from the header)
+  replaces `squish_decompressed_size`. The `squish_archive_*` API is unchanged
+  except `squish_archive_info` now also reports `chunk_size` and a `SINGLE`
+  flag. Removed: `squish_compress`/`_decompress` (caller-buffer), every `_mt`
+  variant, `squish_compress_file2`/`_decompress_file2`, and
+  `squish_decompressed_size`.
+- CLI: `c` packs a file or directory into an archive; `d` restores a single
+  file or extracts a whole tree (chosen by the archive's `SINGLE` flag); `l`
+  and `x` inspect and extract members. Live status line and `-q`/`-t`/`-b`
+  options as before.
+
+### Removed
+
+- The self-extracting archive format and the `squish s` command. Distribute the
+  `.sqsh` archive and the `squish` CLI separately.
 
 ## [1.0.0]
 

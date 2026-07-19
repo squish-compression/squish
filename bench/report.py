@@ -17,8 +17,8 @@
 
 Two tables are emitted:
   1. SQUISH (ratio-optimal single-block) versus zip/bzip2/rar/xz.
-  2. SQUISH's own modes head to head: single-block, multi-threaded, and the
-     self-extracting executable (size, compress/decompress time, verified).
+  2. SQUISH's own modes head to head: single-block versus multi-threaded
+     block-split (size, compress/decompress time, speedup).
 """
 import csv
 import os
@@ -30,7 +30,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RIVALS = ["zip", "bzip2", "rar", "xz"]
-MODES = ["squish-single", "squish-mt", "squish-sfx"]
+MODES = ["squish-single", "squish-mt"]
 
 # file -> tool -> (orig, comp, compress_s, decompress_s)
 data = defaultdict(dict)
@@ -102,22 +102,19 @@ mfiles = order([f for f in data if all(t in data[f] for t in MODES)])
 
 print()
 print("### SQUISH compression modes\n")
-print("Same corpus, three ways to run SQUISH. `single` is the ratio-optimal "
-      "single-block stream; `mt` splits into blocks across all cores (a little "
-      "ratio for a lot of speed); `sfx` is a standalone self-extracting "
-      "executable — its size includes the ~212 KB extractor stub, and its "
-      "round-trip is the stub actually running.\n")
-print("| file | orig | single | c/d s | mt | c/d s | mt Δsize | mt speedup | "
-      "sfx (with stub) | extract s |")
-print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+print("Same corpus, two ways to run SQUISH. `single` is the ratio-optimal "
+      "single-block layout; `mt` splits each member into blocks across all "
+      "cores (a little ratio for a lot of speed). Both write a one-member "
+      "SQUISH archive.\n")
+print("| file | orig | single | c/d s | mt | c/d s | mt Δsize | mt speedup |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|")
 mtot = defaultdict(int); morig = 0
 ct_tot = defaultdict(float); dt_tot = defaultdict(float)
 for f in mfiles:
     o, s_sz, s_ct, s_dt = data[f]["squish-single"]
     _, m_sz, m_ct, m_dt = data[f]["squish-mt"]
-    _, x_sz, x_ct, x_dt = data[f]["squish-sfx"]
     morig += o
-    mtot["single"] += s_sz; mtot["mt"] += m_sz; mtot["sfx"] += x_sz
+    mtot["single"] += s_sz; mtot["mt"] += m_sz
     ct_tot["single"] += s_ct; ct_tot["mt"] += m_ct
     dt_tot["single"] += s_dt; dt_tot["mt"] += m_dt
     dsize = 100.0 * (m_sz - s_sz) / s_sz
@@ -127,7 +124,6 @@ for f in mfiles:
         f"{s_sz:,}", f"{s_ct:.1f}/{s_dt:.1f}",
         f"{m_sz:,}", f"{m_ct:.1f}/{m_dt:.1f}",
         f"{dsize:+.1f}%", f"{speed:.2f}x",
-        f"{x_sz:,}", f"{x_dt:.1f}",
     ]) + " |")
 
 dsize_tot = 100.0 * (mtot["mt"] - mtot["single"]) / mtot["single"]
@@ -137,12 +133,9 @@ print("| " + " | ".join([
     f"**{mtot['single']:,}**", f"{ct_tot['single']:.0f}/{dt_tot['single']:.0f}",
     f"{mtot['mt']:,}", f"{ct_tot['mt']:.0f}/{dt_tot['mt']:.0f}",
     f"{dsize_tot:+.1f}%", f"{speed_tot:.2f}x",
-    f"{mtot['sfx']:,}", "",
 ]) + " |")
 print()
 print(f"  single  {mtot['single']:>12,}  ratio {mtot['single']/morig:.4f}  "
       f"({ct_tot['single']:.0f}s compress)")
 print(f"  mt      {mtot['mt']:>12,}  ratio {mtot['mt']/morig:.4f}  "
       f"({ct_tot['mt']:.0f}s compress, {speed_tot:.2f}x faster, {dsize_tot:+.1f}% size)")
-print(f"  sfx     {mtot['sfx']:>12,}  ratio {mtot['sfx']/morig:.4f}  "
-      f"(+{mtot['sfx']-mtot['single']:,} bytes of stubs over single)")
