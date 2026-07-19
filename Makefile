@@ -27,6 +27,15 @@ MINGW_AR ?= x86_64-w64-mingw32-ar
 CL       ?= cl.exe
 CLFLAGS  ?= /nologo /O2 /W3
 
+# Azure Trusted Signing (opt-in; used by the windows-dll target). Set all three
+# — via the environment or make args — to sign the built binaries with a cloud
+# certificate profile (no local .pfx). Auth uses the Azure credential chain
+# (az login / OIDC / service principal). Signer: the `sign` .NET global tool
+# (https://github.com/dotnet/sign), auto-installed if missing (needs .NET SDK).
+TRUSTED_SIGNING_ENDPOINT ?=
+TRUSTED_SIGNING_ACCOUNT  ?=
+TRUSTED_SIGNING_PROFILE  ?=
+
 all: libsquish.so squish
 
 # ---- shared library ---------------------------------------------------------
@@ -72,9 +81,26 @@ squish.exe: squish_cli.c libsquish-win.a
 # intentional — pick whichever is available on the host.
 # squish.exe links the library statically (compiling squish.c into it, like the
 # mingw rule above) so it stands alone and runs without squish.dll present.
+# When the TRUSTED_SIGNING_* variables are set the binaries are then signed with
+# Azure Trusted Signing; otherwise they are left unsigned (opt-in).
 windows-dll:
 	$(CL) $(CLFLAGS) /LD /DSQUISH_BUILD_DLL /Fe:squish.dll squish.c
 	$(CL) $(CLFLAGS) /Fe:squish.exe squish_cli.c squish.c
+	@if [ -z "$(TRUSTED_SIGNING_ENDPOINT)" ] || [ -z "$(TRUSTED_SIGNING_ACCOUNT)" ] || [ -z "$(TRUSTED_SIGNING_PROFILE)" ]; then \
+	    echo "Note: Azure Trusted Signing not configured (TRUSTED_SIGNING_* unset); binaries are unsigned."; \
+	else \
+	    if ! command -v sign >/dev/null 2>&1; then \
+	        command -v dotnet >/dev/null 2>&1 || { echo "error: Trusted Signing configured but neither 'sign' nor 'dotnet' is on PATH; install the .NET SDK or run 'dotnet tool install --global sign'." >&2; exit 1; }; \
+	        echo "Installing the 'sign' .NET global tool..."; \
+	        dotnet tool install --global sign; \
+	        PATH="$$PATH:$$HOME/.dotnet/tools"; \
+	    fi; \
+	    echo "Signing squish.dll and squish.exe with Azure Trusted Signing..."; \
+	    sign code trusted-signing squish.dll squish.exe \
+	        --trusted-signing-endpoint "$(TRUSTED_SIGNING_ENDPOINT)" \
+	        --trusted-signing-account "$(TRUSTED_SIGNING_ACCOUNT)" \
+	        --trusted-signing-certificate-profile "$(TRUSTED_SIGNING_PROFILE)"; \
+	fi
 
 # ---- tests / examples ---------------------------------------------------------
 test: tests/test_squish

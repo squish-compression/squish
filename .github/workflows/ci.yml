@@ -67,6 +67,9 @@ jobs:
   windows-msvc:
     name: native Windows MSVC build (build-windows.bat)
     runs-on: windows-latest
+    permissions:
+      id-token: write   # request the OIDC federated token for Azure login
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -101,3 +104,42 @@ jobs:
           squish.exe d tree.sq tree-out
           fc /b tree\a.txt tree-out\a.txt
           fc /b tree\sub\b.txt tree-out\sub\b.txt
+
+      # --- Azure Trusted Signing ------------------------------------------------
+      # Sign the built binaries only on pushes to main: pull requests (especially
+      # from forks) cannot access OIDC tokens or secrets, so signing would fail
+      # there. Authentication is OIDC federated — azure/login exchanges the
+      # GitHub id-token for an Azure credential, so no long-lived secret is
+      # stored. Configure in the repo settings:
+      #   Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+      #     (the app registration must have a federated credential trusting this
+      #      repo, and a role granting access to the Trusted Signing account)
+      #   Variables: TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT,
+      #     TRUSTED_SIGNING_PROFILE
+      - name: Azure login (OIDC federated)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign squish.exe + squish.dll (Azure Trusted Signing)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\squish.exe
+            ${{ github.workspace }}\squish.dll
+
+      - name: Upload signed binaries
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: squish-windows-signed
+          path: |
+            squish.exe
+            squish.dll

@@ -42,3 +42,62 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Built squish.dll and squish.exe
+
+rem --- Azure Trusted Signing --------------------------------------------------
+rem Signs the built binaries with Azure Trusted Signing (a cloud certificate
+rem profile; no local .pfx). Signing is opt-in: it runs only when the three
+rem TRUSTED_SIGNING_* variables below are set, so contributors without a
+rem Trusted Signing account still get an (unsigned) build.
+rem
+rem Configure by exporting these in your environment before running:
+rem   TRUSTED_SIGNING_ENDPOINT  region endpoint, e.g. https://eus.codesigning.azure.net/
+rem   TRUSTED_SIGNING_ACCOUNT   your Trusted Signing account name
+rem   TRUSTED_SIGNING_PROFILE   your certificate profile name
+rem
+rem Authentication uses the Azure credential chain (DefaultAzureCredential):
+rem   - Interactive dev machine:  run `az login` first
+rem   - OIDC federated:           set AZURE_CLIENT_ID, AZURE_TENANT_ID and
+rem                               AZURE_FEDERATED_TOKEN_FILE
+rem   - Service principal:        set AZURE_CLIENT_ID, AZURE_TENANT_ID,
+rem                               AZURE_CLIENT_SECRET
+rem The signer is the `sign` .NET global tool (https://github.com/dotnet/sign),
+rem installed automatically below if missing (needs the .NET SDK on PATH).
+
+if not defined TRUSTED_SIGNING_ENDPOINT goto :nosign
+if not defined TRUSTED_SIGNING_ACCOUNT  goto :nosign
+if not defined TRUSTED_SIGNING_PROFILE  goto :nosign
+
+where sign >nul 2>nul
+if %errorlevel%==0 goto :dosign
+
+where dotnet >nul 2>nul
+if not %errorlevel%==0 (
+    echo error: Trusted Signing is configured but neither 'sign' nor 'dotnet'
+    echo is on PATH. Install the .NET SDK, then re-run, or run:
+    echo     dotnet tool install --global sign
+    exit /b 1
+)
+echo Installing the 'sign' .NET global tool...
+dotnet tool install --global sign
+if errorlevel 1 exit /b 1
+rem Make the freshly installed tool reachable in this session.
+set "PATH=%PATH%;%USERPROFILE%\.dotnet\tools"
+
+:dosign
+echo.
+echo Signing squish.dll and squish.exe with Azure Trusted Signing...
+sign code trusted-signing squish.dll squish.exe ^
+    --trusted-signing-endpoint "%TRUSTED_SIGNING_ENDPOINT%" ^
+    --trusted-signing-account "%TRUSTED_SIGNING_ACCOUNT%" ^
+    --trusted-signing-certificate-profile "%TRUSTED_SIGNING_PROFILE%"
+if errorlevel 1 (
+    echo error: code signing failed.
+    exit /b 1
+)
+echo Signed squish.dll and squish.exe
+goto :eof
+
+:nosign
+echo.
+echo Note: Azure Trusted Signing not configured ^(TRUSTED_SIGNING_* unset^); binaries are unsigned.
+goto :eof
