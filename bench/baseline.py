@@ -15,10 +15,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Benchmark baseline compressors (zip -9, bzip2 -9, rar -m5, xz -9e) on the corpus.
 
+Runs on Linux, macOS, and Windows: zip/bzip2/xz use Python's own zlib/bz2/lzma
+(the same libraries the CLI tools wrap, so the compressed sizes match). rar has
+no standard library, so it is measured only when a rar executable is found —
+bundled at tools/rar/rar[.exe] or on PATH — and skipped with a note otherwise.
+
 Writes CSV rows: file,tool,orig_bytes,comp_bytes,compress_s
-Each tool works on a copy in a temp dir so nothing touches the corpus.
 """
+import bz2
 import csv
+import lzma
 import os
 import shutil
 import subprocess
@@ -28,7 +34,28 @@ import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAR = os.path.join(ROOT, "tools", "rar", "rar")
+
+
+def find_rar():
+    """Locate a rar executable runnable on this platform: the bundled copy
+    first, then PATH. The bundled tools/rar/rar is a Linux binary, so it is
+    only considered off Windows; Windows looks for rar.exe on PATH."""
+    bundled = os.path.join(ROOT, "tools", "rar")
+    if os.name == "nt":
+        cands = [os.path.join(bundled, "rar.exe")]
+    else:
+        cands = [os.path.join(bundled, "rar")]
+    for name in ("rar", "WinRAR"):
+        found = shutil.which(name)
+        if found:
+            cands.append(found)
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+RAR = find_rar()
 
 CORPUS = []
 for name in sorted(os.listdir(os.path.join(ROOT, "corpus", "silesia"))):
@@ -38,7 +65,13 @@ for name in sorted(os.listdir(os.path.join(ROOT, "corpus", "canterbury"))):
 CORPUS.append(("enwik8", os.path.join(ROOT, "corpus", "enwik8")))
 
 
+def read_bytes(src):
+    with open(src, "rb") as fh:
+        return fh.read()
+
+
 def bench_zip(src, workdir):
+    """zip -9 (DEFLATE, level 9) via Python's zlib."""
     out = os.path.join(workdir, "out.zip")
     t0 = time.time()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -48,15 +81,24 @@ def bench_zip(src, workdir):
 
 
 def bench_bzip2(src, workdir):
-    cp = os.path.join(workdir, "f")
-    shutil.copy(src, cp)
+    """bzip2 -9 via Python's bz2 (same libbzip2, so the size matches)."""
+    data = read_bytes(src)
     t0 = time.time()
-    subprocess.run(["bzip2", "-9", cp], check=True)
-    dt = time.time() - t0
-    return os.path.getsize(cp + ".bz2"), dt
+    comp = bz2.compress(data, 9)
+    return len(comp), time.time() - t0
+
+
+def bench_xz(src, workdir):
+    """xz -9e via Python's lzma (XZ container, preset 9 + extreme)."""
+    data = read_bytes(src)
+    t0 = time.time()
+    comp = lzma.compress(data, format=lzma.FORMAT_XZ,
+                         preset=9 | lzma.PRESET_EXTREME)
+    return len(comp), time.time() - t0
 
 
 def bench_rar(src, workdir):
+    """rar -m5 (max compression). Needs a rar executable (see find_rar)."""
     out = os.path.join(workdir, "out.rar")
     t0 = time.time()
     subprocess.run(
@@ -67,26 +109,21 @@ def bench_rar(src, workdir):
     return os.path.getsize(out), dt
 
 
-def bench_xz(src, workdir):
-    cp = os.path.join(workdir, "f")
-    shutil.copy(src, cp)
-    t0 = time.time()
-    subprocess.run(["xz", "-9e", "-T", "1", cp], check=True)
-    dt = time.time() - t0
-    return os.path.getsize(cp + ".xz"), dt
-
-
-TOOLS = {"zip": bench_zip, "bzip2": bench_bzip2, "rar": bench_rar, "xz": bench_xz}
-
-
 def main():
+    tools = {"zip": bench_zip, "bzip2": bench_bzip2, "xz": bench_xz}
+    if RAR:
+        tools["rar"] = bench_rar
+    else:
+        print("note: no rar executable found (tools/rar/rar[.exe] or PATH); "
+              "skipping rar", file=sys.stderr)
+
     out_csv = os.path.join(ROOT, "bench", "baselines.csv")
     with open(out_csv, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "tool", "orig_bytes", "comp_bytes", "compress_s"])
         for label, path in CORPUS:
             orig = os.path.getsize(path)
-            for tool, fn in TOOLS.items():
+            for tool, fn in tools.items():
                 with tempfile.TemporaryDirectory(dir=os.path.join(ROOT, "bench")) as td:
                     comp, dt = fn(path, td)
                 w.writerow([label, tool, orig, comp, f"{dt:.2f}"])

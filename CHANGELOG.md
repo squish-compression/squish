@@ -42,6 +42,14 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 - The self-extracting archive format and the `squish s` command. Distribute the
   `.sqsh` archive and the `squish` CLI separately.
 
+### Fixed
+
+- `bench/` now runs on Windows: the baseline benchmark uses Python's built-in
+  `zip`/`bz2`/`lzma` (same libraries as the CLI tools, so sizes match) instead
+  of shelling out to `bzip2`/`xz`, and treats `rar` as optional — measured only
+  when a platform-native rar executable is found, skipped with a note otherwise.
+  `bench/report.py` adapts its tables to whichever rivals are present.
+
 ## [1.0.0]
 
 ### Added

@@ -29,7 +29,8 @@ from collections import defaultdict
 sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RIVALS = ["zip", "bzip2", "rar", "xz"]
+RIVAL_ORDER = ["zip", "bzip2", "rar", "xz"]
+RIVAL_LABEL = {"zip": "zip -9", "bzip2": "bzip2 -9", "rar": "rar -m5", "xz": "xz -9e"}
 MODES = ["squish-single", "squish-mt"]
 
 # file -> tool -> (orig, comp, compress_s, decompress_s)
@@ -42,6 +43,11 @@ for path in ("baselines.csv", "squish.csv"):
                 float(row["compress_s"]),
                 float(row.get("decompress_s") or 0.0))
 
+# Only report rivals actually present in the CSVs — rar is skipped where no rar
+# executable exists (e.g. Windows), and the tables adapt instead of going blank.
+RIVALS = [r for r in RIVAL_ORDER if any(r in v for v in data.values())]
+NAMED = [r for r in RIVALS if r != "xz"]   # "named" rivals: everything but xz
+
 
 def order(files):
     return sorted(files, key=lambda f: -data[f]["squish-single"][0])
@@ -53,10 +59,11 @@ def order(files):
 cols = RIVALS + ["squish-single"]
 files = order([f for f in data if all(t in data[f] for t in cols)])
 
-print("### SQUISH vs zip / bzip2 / rar / xz\n")
+print("### SQUISH vs " + " / ".join(RIVALS) + "\n")
 print("Ratio-optimal single-block SQUISH against each rival's strongest setting.\n")
-print("| file | orig | zip -9 | bzip2 -9 | rar -m5 | xz -9e | SQUISH | vs best rival |")
-print("|---|---:|---:|---:|---:|---:|---:|---:|")
+print("| file | orig | " + " | ".join(RIVAL_LABEL[r] for r in RIVALS) +
+      " | SQUISH | vs best rival |")
+print("|---|---:|" + "---:|" * (len(RIVALS) + 2))
 tot = defaultdict(int); orig_tot = 0
 wins_all = wins_named = 0
 for f in files:
@@ -64,7 +71,7 @@ for f in files:
     sizes = {t: data[f][t][1] for t in cols}
     for t in cols: tot[t] += sizes[t]
     best_rival = min(sizes[t] for t in RIVALS)
-    named_rival = min(sizes[t] for t in ("zip", "bzip2", "rar"))
+    named_rival = min((sizes[t] for t in NAMED), default=best_rival)
     sq = sizes["squish-single"]
     if sq < best_rival: wins_all += 1
     if sq < named_rival: wins_named += 1
@@ -89,8 +96,8 @@ print("| " + " | ".join(row) + " |")
 
 n = len(files)
 print()
-print(f"SQUISH beats zip+bzip2+rar on {wins_named}/{n} files; "
-      f"beats all four (incl. xz -9e) on {wins_all}/{n}.")
+print(f"SQUISH beats {'+'.join(NAMED)} on {wins_named}/{n} files; "
+      f"beats all {len(RIVALS)} (incl. xz -9e) on {wins_all}/{n}.")
 for t in cols:
     label = "squish" if t == "squish-single" else t
     print(f"  {label:7s} total {tot[t]:>12,}  ratio {tot[t]/orig_tot:.4f}")
