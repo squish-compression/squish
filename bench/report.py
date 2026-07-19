@@ -60,7 +60,10 @@ cols = RIVALS + ["squish-single"]
 files = order([f for f in data if all(t in data[f] for t in cols)])
 
 print("### SQUISH vs " + " / ".join(RIVALS) + "\n")
-print("Ratio-optimal single-block SQUISH against each rival's strongest setting.\n")
+print("Ratio-optimal single-block SQUISH against each rival's strongest "
+      "setting. zip/bzip2/xz are measured with Python's zlib/bz2/lzma so the "
+      "suite runs anywhere; rar (no stdlib) is measured with the rar CLI where "
+      "available, and its deterministic sizes carry over otherwise.\n")
 print("| file | orig | " + " | ".join(RIVAL_LABEL[r] for r in RIVALS) +
       " | SQUISH | vs best rival |")
 print("|---|---:|" + "---:|" * (len(RIVALS) + 2))

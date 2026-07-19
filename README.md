@@ -18,11 +18,11 @@ verified. Full table in [bench/RESULTS.md](bench/RESULTS.md).
 
 | tool | total compressed | ratio |
 |---|---:|---:|
-| zip -9 | 104,849,141 | 0.333 |
+| zip -9 | 104,800,190 | 0.333 |
 | bzip2 -9 | 84,058,237 | 0.267 |
 | rar -m5 | 80,560,956 | 0.256 |
 | xz -9e | 73,780,732 | 0.234 |
-| **SQUISH** | **67,430,251** | **0.214** |
+| **SQUISH** | **67,432,463** | **0.214** |
 
 The trade: ~0.6 MB/s, symmetric (decompression costs the same as
 compression), and ~150 MB of model memory per active block. SQUISH spends CPU
