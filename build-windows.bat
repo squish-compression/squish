@@ -86,10 +86,10 @@ set "PATH=%PATH%;%USERPROFILE%\.dotnet\tools"
 :dosign
 echo.
 echo Signing squish.dll and squish.exe with Azure Trusted Signing...
-sign code trusted-signing squish.dll squish.exe ^
-    --trusted-signing-endpoint "%TRUSTED_SIGNING_ENDPOINT%" ^
-    --trusted-signing-account "%TRUSTED_SIGNING_ACCOUNT%" ^
-    --trusted-signing-certificate-profile "%TRUSTED_SIGNING_PROFILE%"
+sign code artifact-signing squish.dll squish.exe ^
+    --artifact-signing-endpoint "%TRUSTED_SIGNING_ENDPOINT%" ^
+    --artifact-signing-account "%TRUSTED_SIGNING_ACCOUNT%" ^
+    --artifact-signing-certificate-profile "%TRUSTED_SIGNING_PROFILE%"
 if errorlevel 1 (
     echo error: code signing failed.
     exit /b 1
