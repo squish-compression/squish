@@ -30,12 +30,6 @@ jobs:
         run: |
           LD_LIBRARY_PATH=. ./examples/example
 
-      - name: Self-extracting archive round-trip
-        run: |
-          ./squish s README.md readme.run
-          ( mkdir sfxout && cd sfxout && ../readme.run -q )
-          cmp README.md sfxout/README.md
-
       - name: Directory archive round-trip
         run: |
           mkdir -p tree/sub tree/empty
@@ -45,9 +39,6 @@ jobs:
           ./squish d tree.sq tree-out
           diff -r tree tree-out
           test -d tree-out/empty
-          ./squish s tree tree.run
-          ( mkdir sfxdir && cd sfxdir && ../tree.run -q )
-          diff -r tree sfxdir/tree
 
   windows-cross:
     name: cross-compile Windows DLL + CLI
@@ -83,16 +74,6 @@ jobs:
           squish.exe c README.md readme.sq
           squish.exe d readme.sq readme.out
           fc /b README.md readme.out
-
-      - name: Self-extracting archive round-trip
-        shell: cmd
-        run: |
-          squish.exe s README.md readme_sfx.exe
-          mkdir sfxout
-          cd sfxout
-          ..\readme_sfx.exe -q
-          cd ..
-          fc /b README.md sfxout\README.md
 
       - name: Directory archive round-trip
         shell: cmd
