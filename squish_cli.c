@@ -361,6 +361,13 @@ int main(int argc, char **argv) {
     int compress = (cmd == 'c');
     if (threads < 0) threads = compress ? 1 : 0;    /* 0 = all cores */
 
+    /* Ratio-optimal default: single-threaded compression with no explicit
+     * block packs each member as one whole-file block (best ratio, one cold
+     * model). Parallel compression (-t 0 / -t N>1) keeps the default block
+     * size so it can actually split a large member across cores. An explicit
+     * -b always wins. */
+    if (compress && block == 0 && threads == 1) block = (size_t)SQUISH_MAX_INPUT;
+
     status st = { compress ? "compressing" : "decompressing", now_sec(), -1 };
     squish_progress_fn cb = (!quiet && SQ_ISATTY(stderr)) ? draw_status : NULL;
 

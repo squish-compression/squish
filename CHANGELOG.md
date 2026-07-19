@@ -44,6 +44,12 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Fixed
 
+- CLI: restore the ratio-optimal default. `squish c` at the default `-t 1`
+  with no `-b` now packs each member as one whole-file block again (best
+  ratio); parallel compression (`-t 0`/`-t N>1`) keeps the 16 MiB default
+  blocks. The format consolidation had made chunking depend only on the block
+  size, so single-threaded compression was splitting large files at 16 MiB and
+  losing ~1–2% of ratio versus the documented single-block default.
 - `bench/` now runs on Windows: the baseline benchmark uses Python's built-in
   `zip`/`bz2`/`lzma` (same libraries as the CLI tools, so sizes match) instead
   of shelling out to `bzip2`/`xz`, and treats `rar` as optional — measured only
